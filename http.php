@@ -65,11 +65,9 @@ abstract class Request {
         $this->application = $application;
         $this->is_complete = false;
         
-        $is_complete =& $this->is_complete;
-        $request =& $this;
-        $this->connection->on_close(function () use (&$request, &$is_complete) {
-            if (!$is_complete) {
-                $request->abort();
+        $this->connection->on_close(function () {
+            if (!$this->is_complete) {
+                $this->abort();
             }
         });
     }
@@ -77,9 +75,9 @@ abstract class Request {
     function complete() {
         $connection =& $this->connection;
         $is_complete =& $this->is_complete;
-        $this->write('', function () use (&$connection, &$is_complete) {
-            $is_complete = true;
-            $connection->close();
+        $this->write('', function () {
+            $this->is_complete = true;
+            $this->connection->close();
         });
     }
     
@@ -121,21 +119,19 @@ class MyRequest extends Request {
     }
     
     function respond() {
-        $request = $this;
         $data = "<table>" .
             "<tr><td>Method</td><td>{$this->method}</td></tr>" .
             "<tr><td>URI</td><td>{$this->uri}</td></tr>" .
             "<tr><td>Headers</td><td>" . print_r($this->headers, true) . "</td></tr>" .
             "<tr><td>Application</td><td>" . print_r($this->application, true) . "</td></tr></table>";
-        $this->write("HTTP/1.0 200 OK\r\nContent-Type: text/html\r\n\r\n<html><body>$data\n", function () use ($request) {
-            $request->flush();
+        $this->write("HTTP/1.0 200 OK\r\nContent-Type: text/html\r\n\r\n<html><body>$data\n", function () {
+            $this->flush();
         });
-        $events = $this->events;
         $count = 1;
-        call_user_func($ping = $request->while_active(function () use ($request, &$ping, $events, &$count) {
-            $request->write("ping! $count<br />");
+        call_user_func($ping = $this->while_active(function () use (&$ping, &$count) {
+            $this->write("ping! $count<br />");
             $count++;
-            $events->after(1200, $ping);
+            $this->events->after(1200, $ping);
         }));
     }
 }
