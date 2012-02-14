@@ -404,23 +404,3 @@ class IO {
         });
     }
 }
-
-function prove($condition) {
-    echo $condition ? '' : '!!! Failed';
-}
-
-$e = new Events();
-$state = 1;
-$e->after(50, function () use (&$state) {
-    echo "A\n";
-    $state *= 2;
-    echo "B\n";
-});
-$e->after(10, function () use (&$state) {
-    echo "C\n";
-    $state += 1;
-    echo "D\n";
-});
-$e->run();
-echo $state;
-prove($state == 4);

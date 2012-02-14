@@ -16,3 +16,5 @@ $e->after(10, function () use (&$state) {
 });
 $e->run();
 prove($state == 4);
+
+echo "Done.\n";
