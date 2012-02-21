@@ -127,6 +127,23 @@ else {
 }
 prove(did_run());
 
+// Test call_user_func
+function user_func($p, $p_plus_one) {
+    must(true);
+    prove($p + 1 == $p_plus_one);
+}
+call_user_func('user_func', 5, 6);
+prove(did_run());
+$call_func = 'call_user_func';
+$call_func('user_func', 100, 101);
+prove(did_run());
+
+call_user_func_array('user_func', array(7, 8));
+prove(did_run());
+$call_func_array = 'call_user_func_array';
+$call_func_array('user_func', array(9, 10));
+prove(did_run());
+
 // Test goto
 $x = 3;
 goto add_one; // forward jump
@@ -342,8 +359,32 @@ prove(array_shift($order) == 'v');
 prove(array_shift($order) == 'b');
 prove(array_shift($order) == 2);
 
+// Try out the Y combinator
+function Y($f) {
+    return call_user_func(
+        function ($r) use ($f) {
+            return $f(function () use ($r) {
+                return call_user_func_array($r($r), func_get_args());
+            });
+        },
+        function ($r) use ($f) {
+            return $f(function () use ($r) {
+                return call_user_func_array($r($r), func_get_args());
+            });
+        }
+    );
+}
+
+$fact = Y(function ($f) {
+    return function ($n) use ($f) {
+        if ($n <= 0) return 1;
+        return $n * $f($n - 1);
+    };
+});
+prove($fact(6) == 720);
+
 // Test exception handling TODO-waiting on builtin classes for "Exception"
 
-// Testing output operators and that the tests completed.
+// Testing output operators and that the tests completed execution.
 print "Do";
 echo "ne.\n";
