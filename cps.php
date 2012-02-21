@@ -1,8 +1,11 @@
 <?php
 
 // TODO
-// builtin classes
+// builtin classes/methods with dynamic calls
 // include/require return values/error handling
+// other error handling - syntax errors, etc.
+// do-while, traits, anything else I missed so far
+// pass down break and continue stack when including to permit break in top level of an included file
 
 // Continuation passing style transformation for PHP
 
@@ -10,10 +13,12 @@ require_once 'PHP-Parser/lib/bootstrap.php';
 require_once 'print.php';
 require_once 'runtime.php';
 
-$compiler = $argv[1] . ' ' . __FILE__ . ' ' . $argv[1];
+$compiler = $argv[1] . ' ' . __FILE__ . ' "' . $argv[1]. '"';
 $file = $argv[3];
 
 const TEMP_NAME = 't';
+const GLOBALS_TEMP_NAME = 'G';
+const ARGS_TEMP_NAME = 'A';
 const CONT_NAME = 'c';
 const LOCALS_NAME = 'l';
 const LABELS_NAME = 'g';
@@ -46,6 +51,21 @@ function config($name, $value = null) {
 }
 config('disable_strict_logical_operator_type', true);
 
+// A container for a single parser node reference
+class NodeReference extends PHPParser_Node_Expr {
+    function __construct(PHPParser_Node_Expr $node) {
+        $this->node = $node;
+    }
+    
+    function getNode() {
+        return $this->node;
+    }
+    
+    function setNode(PHPParser_Node_Expr $node) {
+        $this->node = $node;
+    }
+}
+
 // Wrapper for a closure if it represents a return from a function.
 // This is used to determine whether a given continuation represents
 // a tail call that can be optimized away.
@@ -59,6 +79,22 @@ class ReturnClosure {
     function __invoke() {
         return call_user_func_array($this->closure, func_get_args());
     }
+}
+
+function generateDefaultTemps() {
+    return new PHPParser_Node_Expr_Array(array(
+        new PHPParser_Node_Expr_ArrayItem(
+            new PHPParser_Node_Expr_Variable('GLOBALS'),
+            new PHPParser_Node_Scalar_String(GLOBALS_TEMP_NAME)
+        ),
+        new PHPParser_Node_Expr_ArrayItem(
+            new PHPParser_Node_Expr_FuncCall(new PHPParser_Node_Name('array_slice'), array(
+                new PHPParser_Node_Expr_FuncCall(new PHPParser_Node_Name('func_get_args'), array()),
+                new PHPParser_Node_Scalar_LNumber(2)
+            )),
+            new PHPParser_Node_Scalar_String(ARGS_TEMP_NAME)
+        )
+    ));
 }
 
 function generateTemp() {
@@ -165,8 +201,6 @@ function generateReturn($value, $state) {
     if (!isset($value)) {
         $value = new PHPParser_Node_Expr_ConstFetch(new PHPParser_Node_Name('null'));
     }
-    
-    if ($state instanceof FunctionState)
     
     $is_return_by_ref = $state ? $state->getIsReturnByRef() : false;
     $is_return_by_ref &= isLValue($value); // Don't try to return rvalue by ref. Simulates PHP behavior on return by reference.
@@ -617,6 +651,9 @@ function traverseNode($node, $next, $final, $state) {
     elseif ($node instanceof PHPParser_Node_Scalar_FileConst) {
         return $next(new PHPParser_Node_Scalar_String($GLOBALS['file']), $final, $state);
     }
+    elseif ($node instanceof PHPParser_Node_Scalar_DirConst) {
+        return $next(new PHPParser_Node_Scalar_String(dirname($GLOBALS['file'])), $final, $state);
+    }
     elseif ($node instanceof PHPParser_Node_Scalar_Encapsed) {
         return call_user_func($loop = function ($parts, $compiled_parts, $final, $state) use (&$loop, $next) {
             if (count($parts)) {
@@ -631,7 +668,28 @@ function traverseNode($node, $next, $final, $state) {
             }
         }, $node->parts, array(), $final, $state);
     }
-    elseif ($node === null || is_string($node) || $node instanceof PHPParser_Node_Scalar || $node instanceof PHPParser_Node_Expr_ConstFetch || $node instanceof PHPParser_Node_Name) {
+    elseif ($node instanceof PHPParser_Node_Expr_ConstFetch && $node->name->toString() == '__COMPILER_HALT_OFFSET__') {
+        if (isset($GLOBALS['compiler_halt_offset'])) {
+            $result = $GLOBALS['compiler_halt_offset'];
+        }
+        else {
+            $result = new NodeReference($node);
+            $GLOBALS['compiler_halt_offset_nodes'][] = $result;
+        }
+        return $next($result, $final, $state);
+    }
+    elseif ($node instanceof PHPParser_Node_Stmt_HaltCompiler) {
+        $offset = new PHPParser_Node_Scalar_LNumber(strlen($GLOBALS['source']) - strlen($node->remaining));
+        if (isset($GLOBALS['compiler_halt_offset_nodes'])) {
+            foreach ($GLOBALS['compiler_halt_offset_nodes'] as $offset_node) {
+                $offset_node->setNode($offset);
+            }
+            unset($GLOBALS['compiler_halt_offset_nodes']);
+        }
+        $GLOBALS['compiler_halt_offset'] = $offset;
+        return $final(generateReturn(new PHPParser_Node_Expr_ConstFetch(new PHPParser_Node_Name('null')), $state), $state);
+    }
+    elseif ($node === null || is_string($node) || $node instanceof PHPParser_Node_Scalar || $node instanceof PHPParser_Node_Expr_ConstFetch || $node instanceof PHPParser_Node_Name || $node instanceof PHPParser_Node_Stmt_InlineHTML) {
         return $next($node, $final, $state);
     }
     elseif ($node instanceof PHPParser_Node_Stmt_While) {
@@ -777,7 +835,10 @@ function traverseNode($node, $next, $final, $state) {
     }
     elseif ($node instanceof PHPParser_Node_Stmt_Return) {
         return traverseNode($node->expr, new ReturnClosure(function ($expr, $final, $state) use ($next) {
-            return $final(generateReturn($expr, $state), $state); // skip calling $next, since return completes the function
+            return $next(null, function ($stmts_x, $state_x) use ($expr, $state, $final) {
+                // Executable statements after a return are not reached, but we run the compiler over them in case doing so has side effects internal to the compiler (like __halt_compiler())
+                return $final(generateReturn($expr, $state), $state);
+            }, $state);
         }), $final, $state);
     }
     elseif ($node instanceof PHPParser_Node_Expr_FuncCall) {
@@ -828,7 +889,7 @@ function traverseNode($node, $next, $final, $state) {
                     ),
                     new PHPParser_Node_Expr_Assign(
                         new PHPParser_Node_Expr_Variable(TEMP_NAME),
-                        new PHPParser_Node_Expr_Array()
+                        generateDefaultTemps()
                     ),
                     new PHPParser_Node_Expr_Assign(
                         new PHPParser_Node_Expr_Variable(LABELS_NAME),
@@ -875,7 +936,7 @@ function traverseNode($node, $next, $final, $state) {
                     ),
                     new PHPParser_Node_Expr_Assign(
                         new PHPParser_Node_Expr_Variable(TEMP_NAME),
-                        new PHPParser_Node_Expr_Array()
+                        generateDefaultTemps()
                     ),
                     new PHPParser_Node_Expr_Assign(
                         new PHPParser_Node_Expr_Variable(LABELS_NAME),
@@ -1024,7 +1085,10 @@ function traverseNode($node, $next, $final, $state) {
                                     $name
                                 ),
                                 new PHPParser_Node_Expr_ArrayDimFetch(
-                                    new PHPParser_Node_Expr_Variable('GLOBALS'),
+                                    new PHPParser_Node_Expr_ArrayDimFetch(
+                                        new PHPParser_Node_Expr_Variable(TEMP_NAME),
+                                        new PHPParser_Node_Scalar_String(GLOBALS_TEMP_NAME)
+                                    ),
                                     $name
                                 )
                             );
@@ -1213,7 +1277,7 @@ function traverseNode($node, $next, $final, $state) {
                     // Directly access superglobals. Don't go through the locals.
                     return $next(new PHPParser_Node_Expr_Variable($name), $final, $state);
                 }
-                
+
                 $name = new PHPParser_Node_Scalar_String($name);
             }
             return $next(new PHPParser_Node_Expr_ArrayDimFetch(
@@ -1374,7 +1438,7 @@ function traverseNode($node, $next, $final, $state) {
                         ),
                         new PHPParser_Node_Expr_Assign(
                             new PHPParser_Node_Expr_Variable(TEMP_NAME),
-                            new PHPParser_Node_Expr_Array()
+                            generateDefaultTemps()
                         ),
                         new PHPParser_Node_Expr_Assign(
                             new PHPParser_Node_Expr_Variable(LABELS_NAME),
@@ -1549,7 +1613,9 @@ function traverseNode($node, $next, $final, $state) {
                             new PHPParser_Node_Arg($file),
                             new PHPParser_Node_Arg(new PHPParser_Node_Scalar_String($GLOBALS['compiler'])),
                             new PHPParser_Node_Arg($is_once),
-                            new PHPParser_Node_Arg($is_require)
+                            new PHPParser_Node_Arg($is_require), 
+                            new PHPParser_Node_Arg(new PHPParser_Node_Scalar_String($GLOBALS['file'])),
+                            new PHPParser_Node_Arg(new PHPParser_Node_Scalar_LNumber($node->getLine()))
                         ))
                     ))
                 )), $state);
@@ -1579,24 +1645,18 @@ function run($thunk) {
 // Returns a transformed tree.
 function compile($code) {
     $parser = new PHPParser_Parser();
-    $stmts = $parser->parse(new PHPParser_Lexer($code));
-    
-    if (false) {
-        $nodeDumper = new PHPParser_NodeDumper;
-        echo $nodeDumper->dump($stmts);
-        return $stmts;
+    try {
+        $stmts = $parser->parse(new PHPParser_Lexer($code));
+    }
+    catch (PHPParser_Error $e) {
+        echo "\nParse error: " . $e->getMessage() . ' in ' . $GLOBALS['file'] . "\n";
+        exit(255);
     }
     
     return run(function ($cont) use ($stmts) {
         $state = new FunctionState();
         return traverseStatements($stmts, $cont, generateReturn(new PHPParser_Node_Expr_ConstFetch(new PHPParser_Node_Name('null')), $state), $state, true);
     });
-}
-
-if (false) {
-    $nodeDumper = new PHPParser_NodeDumper;
-    echo $nodeDumper->dump($compiled);
-    exit();
 }
 
 function generateTrampoline($stmts) {
@@ -1679,15 +1739,18 @@ function generateTrampoline($stmts) {
     ));
 }
 
+$source = file_get_contents('php://stdin');
+$compiled = compile($source);
+
 switch ($mode = $argv[2]) {
     case 'main':
-        echo "<?php\nrequire_once('runtime.php');\n\$l=&\$GLOBALS;\n\$t=array();\n\$g=array();\n";
-        printStatements(generateTrampoline(compile(file_get_contents('php://stdin'))));
+        echo "<?php\nrequire_once('" . dirname(__FILE__) . "/runtime.php');\n\$l=&\$GLOBALS;\n\$t=array();\n\$g=array();\n";
+        printStatements(generateTrampoline($compiled));
         echo "\n";
         break;
 
     case 'include':
-        printStatements(compile(file_get_contents('php://stdin')));
+        printStatements($compiled);
         break;
     
     default:

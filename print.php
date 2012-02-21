@@ -154,6 +154,10 @@ function printAssignList($vars) {
 }
 
 function printNode($node, $precedence = null) {
+    if ($node instanceof NodeReference) {
+        return printNode($node->getNode(), $precedence);
+    }
+
     if (!isset($precedence)) {
         $precedence = 19;
     }
@@ -579,7 +583,7 @@ function printNode($node, $precedence = null) {
             case 'Expr_ArrayItem':
                 if (null !== $node->key) {
                     printNode($node->key);
-                    echo ' => ';
+                    echo '=>';
                 }
                 echo $node->byRef ? '&' : '';
                 printNode($node->value);

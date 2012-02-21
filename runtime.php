@@ -1,13 +1,12 @@
 <?php
 
-function _cps_include($file, $compiler, $is_once, $is_require) {
+function _cps_include($file, $compiler, $is_once, $is_require, $from_file, $from_line) {
     static $includes = array();
     
+    $original_file = $file;
+    $include_path = get_include_path();
     if (!is_readable($file)) {
-        foreach (explode(PATH_SEPARATOR, get_include_path()) as $path) {
-            while (substr($path, -1) == '/') {
-                $path = substr($path, 0, strlen($path) - 1);
-            }
+        foreach (explode(PATH_SEPARATOR, $include_path) as $path) {
             $candidate = "$path/$file";
             if (is_readable($candidate)) {
                 $file = $candidate;
@@ -17,24 +16,38 @@ function _cps_include($file, $compiler, $is_once, $is_require) {
     }
     $file = realpath($file);
     
-    if (array_key_exists($file, $includes)) {
+    if ($file && array_key_exists($file, $includes)) {
         if ($is_once) {
-            return '';
+            return 'return function () use ($c) { return $c(true); };';
         }
         else {
             return $includes[$file];
         }
     }
     else {
+        $function_name = $function_name = 'require' . ($is_once ? '_once' : '');
         if (is_readable($file)) {
-            $compiled = `$compiler include $file < $file`;
-            // TODO check for compile error
-            return $includes[$file] = $compiled;
+            exec("$compiler include $file < $file", $output, $return_value);
+            $output[] = '';
+            $output = implode("\n", $output);
+            if ($return_value == 0) { // if there was no compile error
+                return $includes[$file] = $output;
+            }
+            else {
+                $error = $output;
+            }
         }
         else {
-            // TODO error out
-            return '';
+            $error = "\nFatal error: $function_name(): Failed opening required '$original_file' (include_path='$include_path') in $from_file on line $from_line\n";
         }
+    }
+    
+    if ($is_require) {
+        echo $error;
+        exit(255);
+    }
+    else {
+        return 'return function () use ($c) { return $c(false); };';
     }
 }
 
@@ -74,6 +87,20 @@ foreach (get_loaded_extensions() as $extension) {
         $BUILTIN_FUNCTIONS[$name] = $simple_builtin;
     }
 }
+
+$STATIC_FUNCTION_TRANSFORM['func_get_args'] = function ($function, $args, $state) {
+    return array(new PHPParser_Node_Stmt_Return(
+        new PHPParser_Node_Expr_FuncCall(new PHPParser_Node_Expr_Variable(CONT_NAME), array(
+            new PHPParser_Node_Expr_ArrayDimFetch(
+                new PHPParser_Node_Expr_Variable(TEMP_NAME),
+                new PHPParser_Node_Scalar_String(ARGS_TEMP_NAME)
+            )
+        ))
+    ));
+};
+//$BUILTIN_FUNCTIONS['func_get_args'] = function ($f, $args, $c, $x, $t) {
+//    return $c($t['A']);
+//};
 
 $builtin_classes = array('Exception');
 foreach ($builtin_classes as $class) {
@@ -128,10 +155,23 @@ $BUILTIN_FUNCTIONS['call_user_func'] = function ($f, $args, $c, $x) {
 
 $STATIC_FUNCTION_TRANSFORM['call_user_func_array'] = function ($function, $args, $state) {
     $function = array_shift($args)->value;
-    $args = array_map(function ($arg) {
-        return new PHPParser_Node_Arg($arg);
-    }, array_shift($args)->value);
-    return generateFunctionCall($function, $args, $state);
+    $args = array_shift($args)->value;
+    
+    $stmts = array();
+    $args = assignToTemp($args, $stmts);
+    $stmts[] = new PHPParser_Node_Expr_FuncCall(new PHPParser_Node_Name('array_unshift'), array(
+        $args, $state->generateExceptParameter()
+    ));
+    $stmts[] = new PHPParser_Node_Expr_FuncCall(new PHPParser_Node_Name('array_unshift'), array(
+        $args, new PHPParser_Node_Expr_Variable(CONT_NAME)
+    ));
+    
+    $stmts[] = new PHPParser_Node_Stmt_Return(
+        new PHPParser_Node_Expr_FuncCall(new PHPParser_Node_Name('call_user_func_array'), array(
+            $function, $args
+        ))
+    );
+    return $stmts;
 };
 $BUILTIN_FUNCTIONS['call_user_func_array'] = function ($f, $args, $c, $x) {
     $f = array_shift($args);
