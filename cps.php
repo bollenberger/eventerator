@@ -1,9 +1,7 @@
 <?php
 
 // TODO
-// builtin classes/methods and dynamic method calls
-// builtins that take callbacks need to have callbacks wrapped with trampolines
-// include/require by file rather than eval (and cache compiled forms)
+// static variables
 // line number mappings in generated code (comments)
 // traits
 // namespaces
@@ -31,7 +29,6 @@ const USES_NAME = 'u';
 const EXCEPT_NAME = 'x';
 
 const STATICS_NAME = 's';
-const KEY_NAME = 'k';
 $SUPERGLOBALS = array('GLOBALS', '_SERVER', '_GET', '_POST', '_FILES', '_COOKIE', '_SESSION', '_REQUEST', '_ENV');
 $MAGIC_METHODS = array('__construct', '__set', '__get', '__destruct', '__sleep', '__wakeup', '__toString', '__isset', '__unset', '__call', '__callStatic', '__set_state', '__clone');
 
