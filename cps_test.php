@@ -18,6 +18,11 @@ function did_run() {
     return $dr;
 }
 
+// Test arithmetic associativity at equal precedence
+prove(1 - (2 - 3) == 2);
+prove(1 - 2 - 3 == -4);
+prove((1 - 2) - 3 == -4);
+
 // Test simple function call
 function function_call() {
     return 'result';
@@ -166,8 +171,33 @@ while ($x < 2) {
 }
 prove($x == 2);
 
-// Test if
+// Test do/while
+$x = 0;
+do {
+    $x++;
+} while (false);
+prove($x == 1);
+do {
+    $x++;
+} while ($x < 3);
+prove($x == 3);
 
+// Test for
+$y = 0;
+for ($x = 0; $x < 10; ++$x) {
+    ++$y;
+}
+prove($x == 10);
+prove($y == 10);
+$z = 0;
+for ($x = 0, $y = 0; $x < 500, $y > -5; ++$x, --$y) {
+    ++$z;
+}
+prove($z == 5);
+prove($x == 5);
+prove($y == -5);
+
+// Test if
 if (true) {
     must(true);
 }
@@ -188,6 +218,22 @@ else{
 prove(!did_run());
 if (false) {
     prove(false);
+}
+else {
+    must(true);
+}
+prove(did_run());
+
+if (false) {
+}
+elseif (true) {
+    must(true);
+}
+prove(did_run());
+
+if (false) {
+}
+elseif (false) {
 }
 else {
     must(true);
@@ -327,12 +373,20 @@ class Derived extends Base {
 }
 
 prove(42 == Base::MY_CONST);
-$d = Derived::__allocate(); // yes, really
-prove('construct!' == $d->__initialize(5));
 $d = new Derived(5);
 $x = 7;
 prove(11 == $d->foo(1, $x));
 prove(6 == $x);
+
+// Test clone
+/*class CloneClass {
+    public $a = 5;
+}
+$f = new CloneClass();
+$g = clone $f;
+$f->a = 6;
+prove($f->a == 6);
+prove($g->a == 5);*/
 
 // Test foreach and order of operations
 $order = array();
@@ -358,6 +412,19 @@ prove(array_shift($order) == 'k');
 prove(array_shift($order) == 'v');
 prove(array_shift($order) == 'b');
 prove(array_shift($order) == 2);
+prove($k == 'b');
+prove($v == 2);
+
+// Test foreach by reference
+$a = array(1,2,3);
+foreach ($a as &$v) {
+    $v = $v * 2;
+}
+prove($a[0] == 2);
+foreach ($a as &$v) { // make sure that foreach resets by iterating again
+    $v = $v + 1;
+}
+prove($a[2] == 7);
 
 // Try out the Y combinator
 function Y($f) {
@@ -383,8 +450,53 @@ $fact = Y(function ($f) {
 });
 prove($fact(6) == 720);
 
-// Test exception handling TODO-waiting on builtin classes for "Exception"
+// Test inheritance from builtin and "fast" methods
+class FooException extends Exception {
+    function fast() {
+        'fast';
+        return 5+5;
+    }
+    
+    function slow() {
+        return $this->fast() + 5;
+    }
+}
+
+$f = new FooException();
+prove($f->slow() == 15);
+prove(is_string($f->getFile()));
+
+// Test exception handling
+try {
+    throw new Exception('what');
+}
+catch (Exception $e) {
+    prove($e->getMessage() == 'what');
+    must(true);
+}
+prove(did_run());
+
+function throw_exception() {
+    throw new Exception('thrown');
+}
+function catch_exception() {
+    try {
+        try {
+            throw_exception();
+        }
+        catch (Exception $e) {
+            return 1;
+        }
+    }
+    catch (Exception $e) {
+        return 2;
+    }
+    return 3;
+}
+prove(1 == catch_exception());
 
 // Testing output operators and that the tests completed execution.
-print "Do";
+?>
+D<?php
+print "o";
 echo "ne.\n";

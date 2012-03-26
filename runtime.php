@@ -1,6 +1,41 @@
 <?php
 
-function _cps_include($file, $compiler, $is_once, $is_require, $from_file, $from_line) {
+function _cps_include($file, $compiler, $is_require) {
+    $include_path = get_include_path();
+    if (!is_readable($file)) {
+        foreach (explode(PATH_SEPARATOR, $include_path) as $path) {
+            $candidate = "$path/$file";
+            if (is_readable($candidate)) {
+                $file = $candidate;
+                break;
+            }
+        }
+    }
+    $file = realpath($file);
+    
+    $tempfile = sys_get_temp_dir() . '/cps.' . getmyuid() . $file;
+    
+    if (!is_readable($tempfile) || filemtime($tempfile) < filemtime($file)) {
+        // recompile if out of date
+        @mkdir(dirname($tempfile), 0700, true);
+        exec("$compiler include $file < $file > $tempfile", $output, $return_value);
+    }
+    else {
+        $return_value = 0;
+    }
+    
+    if ($return_value == 0) {
+        return $tempfile;
+    }
+    else {
+        $error = implode("\n", $output) . readfile($tempfile);
+        unlink($tempfile);
+        echo $error;
+        return $tempfile;
+    }
+}
+
+function _cps_include_eval($file, $compiler, $is_once, $is_require, $from_file, $from_line) {
     static $includes = array();
     
     $original_file = $file;
@@ -25,7 +60,7 @@ function _cps_include($file, $compiler, $is_once, $is_require, $from_file, $from
         }
     }
     else {
-        $function_name = $function_name = 'require' . ($is_once ? '_once' : '');
+        $function_name = 'require' . ($is_once ? '_once' : '');
         if (is_readable($file)) {
             exec("$compiler include $file < $file", $output, $return_value);
             $output[] = '';
@@ -49,6 +84,38 @@ function _cps_include($file, $compiler, $is_once, $is_require, $from_file, $from
     else {
         return 'return function () use ($c) { return $c(false); };';
     }
+}
+
+function &_cps_trampoline($thunk) {
+    $result_container = null;
+    $exception_container = null;
+    $has_exited = false;
+    $return_continuation = function ($result, &$result_ref = null, $is_ref = false) use (&$result_container, &$has_exited) {
+        if ($has_exited) {
+            throw new Exception('Exiting from trampoline a second time. Program will terminate.');
+        }
+        $has_exited = true;
+        $is_ref ? $result_container =& $result_ref : $result_container = $result;
+    };    
+    $exception_continuation = array(function ($exception) use (&$exception_container, &$is_exited) {
+        if ($has_exited) {
+            throw new Exception('Exiting from trampoline a second time. Program will terminate.');
+        }
+        $has_exited = true;
+        $exception_container = $exception;
+    });
+    while ($thunk) {
+        $thunk = $thunk($return_continuation, $exception_continuation);
+        if ($has_exited) {
+            if ($exception_container) {
+                throw $exception_container[0];
+            }
+            else {
+                return $result_container;
+            }
+        }
+    }
+    throw new Exception('Trampoline exited without return value');
 }
 
 // Simple pass by value builtin functions
@@ -81,10 +148,24 @@ $simple_builtin = function ($f, $args, $c, $x) {
     }
 };
 
+function __cps_add_builtin($name) {
+    global $STATIC_FUNCTION_TRANSFORM, $BUILTIN_FUNCTIONS, $simple_builtin_static_transform, $simple_builtin;
+    $STATIC_FUNCTION_TRANSFORM[$name] = $simple_builtin_static_transform;
+    $BUILTIN_FUNCTIONS[$name] = $simple_builtin;
+}
+
 foreach (get_loaded_extensions() as $extension) {
     foreach (get_extension_funcs($extension) ?: array() as $name) {
-        $STATIC_FUNCTION_TRANSFORM[$name] = $simple_builtin_static_transform;
-        $BUILTIN_FUNCTIONS[$name] = $simple_builtin;
+/*foreach (array(
+'ob_implicit_flush',
+'ob_start',
+'str_repeat',
+'array_fill',
+'substr',
+'strlen',
+'print'
+) as $name) {*/
+        __cps_add_builtin($name);
     }
 }
 
@@ -98,13 +179,40 @@ $STATIC_FUNCTION_TRANSFORM['func_get_args'] = function ($function, $args, $state
         ))
     ));
 };
-//$BUILTIN_FUNCTIONS['func_get_args'] = function ($f, $args, $c, $x, $t) {
+//TODO$BUILTIN_FUNCTIONS['func_get_args'] = function ($f, $args, $c, $x, $t) {
 //    return $c($t['A']);
 //};
 
+foreach (array(
+    'spl_autoload_register' => array(0),
+    'array_map' => array(0),
+    'preg_replace_callback' => array(1)
+    ) as $function_name => $indices)
+{
+    $STATIC_FUNCTION_TRANSFORM[$function_name] = function ($function, $args, $state) use ($indices) {
+        foreach ($indices as $i) {
+            if (count($args) > $i) {
+                $args[$i] = new PHPParser_Node_Arg(wrapFunctionForCallback($args[$i]->value, $state));
+            }
+            return $GLOBALS['simple_builtin_static_transform']($function, $args, $state);
+        }
+    };
+}
+
+function __cps_add_builtin_method($class, $method) {
+    global $CLASS_TO_BUILTIN_METHODS;
+    $CLASS_TO_BUILTIN_METHODS[$class][$method] = true;
+}
+$CLASS_TO_BUILTIN_METHODS = array();
 $builtin_classes = array('Exception');
 foreach ($builtin_classes as $class) {
-    // TODO - do something for builtin classes
+    $class_obj = new ReflectionClass($class);
+    
+    $methods = array();
+    foreach ($class_obj->getMethods(ReflectionMethod::IS_PUBLIC | ReflectionMethod::IS_PROTECTED) as $method_obj) {
+        $methods[$method_obj->name] = true;
+    }
+    $CLASS_TO_BUILTIN_METHODS[$class] = $methods;
 }
 
 // normal user function CPS calling convention for dynamic dispatch (could be used for static too at a slight runtime cost)
@@ -136,7 +244,7 @@ $STATIC_FUNCTION_TRANSFORM['callcc'] = function ($function, $args, $state) {
     )), $state);
 };
 $BUILTIN_FUNCTIONS['callcc'] = function ($f, $args, $c, $x) { // allows dynamic call to callcc. crazy, right?
-    return $args[0]($c, $x, function ($j, $j, $v) use ($c) {
+    return $args[0]($c, $x, function ($jc, $jx, $v) use ($c) {
         return $c($v);
     });
 };

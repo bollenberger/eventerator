@@ -1,10 +1,13 @@
 <?php
 
 // TODO
-// builtin classes/methods with dynamic calls
-// include/require return values/error handling
-// other error handling - syntax errors, etc.
-// do-while, traits, anything else I missed so far
+// builtin classes/methods and dynamic method calls
+// builtins that take callbacks need to have callbacks wrapped with trampolines
+// include/require by file rather than eval (and cache compiled forms)
+// line number mappings in generated code (comments)
+// traits
+// namespaces
+// break and continue by non-const number (include array of basic block IDs in compiled code)
 // pass down break and continue stack when including to permit break in top level of an included file
 
 // Continuation passing style transformation for PHP
@@ -12,9 +15,6 @@
 require_once 'PHP-Parser/lib/bootstrap.php';
 require_once 'print.php';
 require_once 'runtime.php';
-
-$compiler = $argv[1] . ' ' . __FILE__ . ' "' . $argv[1]. '"';
-$file = $argv[3];
 
 const TEMP_NAME = 't';
 const GLOBALS_TEMP_NAME = 'G';
@@ -28,15 +28,12 @@ const VALUE_IS_REF_NAME = 'q';
 const JUNK_NAME = 'j';
 const PARAM_NAME = 'p';
 const USES_NAME = 'u';
-const INITIALIZE_NAME = '__initialize';
-const NEW_NAME = '__new';
-const ALLOCATE_NAME = '__allocate';
 const EXCEPT_NAME = 'x';
 
 const STATICS_NAME = 's';
 const KEY_NAME = 'k';
 $SUPERGLOBALS = array('GLOBALS', '_SERVER', '_GET', '_POST', '_FILES', '_COOKIE', '_SESSION', '_REQUEST', '_ENV');
-$MAGIC_METHODS = array('__set', '__get', '__destruct', '__sleep', '__wakeup', '__toString', '__isset', '__unset', '__call', '__callStatic', '__set_state', '__clone');
+$MAGIC_METHODS = array('__construct', '__set', '__get', '__destruct', '__sleep', '__wakeup', '__toString', '__isset', '__unset', '__call', '__callStatic', '__set_state', '__clone');
 
 function config($name, $value = null) {
     static $configs = array();
@@ -49,7 +46,32 @@ function config($name, $value = null) {
         }
     }
 }
-config('disable_strict_logical_operator_type', true);
+config('disable_strict_logical_operator_type', false);
+config('disable_func_get_args', false);
+config('trampoline_max_stack', 40); // optimum seems to be around 40 or 50
+
+$interpreter = $argv[1];
+$compiler = $interpreter . ' ' . __FILE__ . ' "' . $interpreter . '"';
+$file = $argv[3];
+$source = file_get_contents('php://stdin');
+$compiled = compile($source);
+
+switch ($mode = $argv[2]) {
+    case 'main':
+        echo "<?php\nrequire_once('" . dirname(__FILE__) . "/runtime.php');\n\$l=&\$GLOBALS;\n\$t=array('" . GLOBALS_TEMP_NAME . "'=>&\$GLOBALS);\n\$g=array();\n";
+        printStatements(generateTrampoline($compiled));
+        echo "\n";
+        break;
+
+    case 'include':
+        echo "<?php\n";
+        printStatements($compiled);
+        break;
+    
+    default:
+        throw new Exception('unknown mode ' . $mode);
+        break;
+}
 
 // A container for a single parser node reference
 class NodeReference extends PHPParser_Node_Expr {
@@ -82,19 +104,22 @@ class ReturnClosure {
 }
 
 function generateDefaultTemps() {
-    return new PHPParser_Node_Expr_Array(array(
-        new PHPParser_Node_Expr_ArrayItem(
-            new PHPParser_Node_Expr_Variable('GLOBALS'),
-            new PHPParser_Node_Scalar_String(GLOBALS_TEMP_NAME)
-        ),
-        new PHPParser_Node_Expr_ArrayItem(
+    $temps = array();
+    $temps[] = new PHPParser_Node_Expr_ArrayItem(
+        new PHPParser_Node_Expr_Variable('GLOBALS'),
+        new PHPParser_Node_Scalar_String(GLOBALS_TEMP_NAME),
+        true
+    );
+    if (!config('disable_func_get_args')) {
+        $temps[] = new PHPParser_Node_Expr_ArrayItem(
             new PHPParser_Node_Expr_FuncCall(new PHPParser_Node_Name('array_slice'), array(
                 new PHPParser_Node_Expr_FuncCall(new PHPParser_Node_Name('func_get_args'), array()),
                 new PHPParser_Node_Scalar_LNumber(2)
             )),
             new PHPParser_Node_Scalar_String(ARGS_TEMP_NAME)
-        )
-    ));
+        );
+    }
+    return new PHPParser_Node_Expr_Array($temps);
 }
 
 function generateTemp() {
@@ -108,9 +133,10 @@ function generateTemp() {
 // Assign an expression to a temp or inline simple variable names.
 // Appends an assignment statement to $stmts if necessary.
 // Returns the name by which the expression will be known.
-function assignToTemp($expr, &$stmts) {
+function assignToTemp($expr, &$stmts, $byRef = false) {
     $temp = generateTemp();
-    $stmts[] = new PHPParser_Node_Expr_Assign($temp, $expr);
+    $assign = $byRef ? 'PHPParser_Node_Expr_AssignRef' : 'PHPParser_Node_Expr_Assign';
+    $stmts[] = new $assign($temp, $expr);
     return $temp;
 }
 
@@ -120,14 +146,15 @@ function boolifyLogicalOperator($expr) {
     // we cut down a bit of bloat by configurably turning this into the identity function.
     if (config('disable_strict_logical_operator_type')) return $expr;
     
+    $temp = generateTemp();
     return new PHPParser_Node_Expr_Ternary(
         new PHPParser_Node_Expr_FuncCall(
             new PHPParser_Node_Name('is_bool'),
-            array($expr)
+            array(new PHPParser_Node_Expr_Assign($temp, $expr))
         ),
-        $expr,
+        $temp,
         new PHPParser_Node_Expr_Ternary(
-            $expr,
+            $temp,
             new PHPParser_Node_Scalar_LNumber(1),
             new PHPParser_Node_Scalar_LNumber(0)
         )
@@ -192,7 +219,6 @@ function isLValue($expr) {
         $expr instanceof PHPParser_Node_Expr_PropertyFetch ||
         $expr instanceof PHPParser_Node_Expr_StaticCall ||
         $expr instanceof PHPParser_Node_Expr_StaticPropertyFetch);
-        
 }
 
 // When you need to call the current continuation with a return value, this function
@@ -205,76 +231,187 @@ function generateReturn($value, $state) {
     $is_return_by_ref = $state ? $state->getIsReturnByRef() : false;
     $is_return_by_ref &= isLValue($value); // Don't try to return rvalue by ref. Simulates PHP behavior on return by reference.
     
-    return array(
-        new PHPParser_Node_Stmt_Return(
-            new PHPParser_Node_Expr_Closure(array(
-                'uses' => array(
-                    new PHPParser_Node_Expr_ClosureUse(CONT_NAME),
-                    new PHPParser_Node_Expr_ClosureUse(LOCALS_NAME, true),
-                    new PHPParser_Node_Expr_ClosureUse(TEMP_NAME, true)
-                ),
-                'stmts' => array(new PHPParser_Node_Stmt_Return(
-                    new PHPParser_Node_Expr_FuncCall(
-                        new PHPParser_Node_Expr_Variable(CONT_NAME),
-                        $is_return_by_ref ?
-                            array(
-                                new PHPParser_Node_Expr_ConstFetch(new PHPParser_Node_Name('null')),
-                                new PHPParser_Node_Arg($value),
-                                new PHPParser_Node_Expr_ConstFetch(new PHPParser_Node_Name('true'))
-                            )
-                            :
-                            array(new PHPParser_Node_Arg($value))
+    return array(generateThunk(
+        array(
+            new PHPParser_Node_Expr_ClosureUse(CONT_NAME),
+            new PHPParser_Node_Expr_ClosureUse(LOCALS_NAME, true),
+            new PHPParser_Node_Expr_ClosureUse(TEMP_NAME, true)
+        ),
+        array(new PHPParser_Node_Stmt_Return(
+            new PHPParser_Node_Expr_FuncCall(
+                new PHPParser_Node_Expr_Variable(CONT_NAME),
+                $is_return_by_ref ?
+                    array(
+                        new PHPParser_Node_Expr_ConstFetch(new PHPParser_Node_Name('null')),
+                        new PHPParser_Node_Arg($value),
+                        new PHPParser_Node_Expr_ConstFetch(new PHPParser_Node_Name('true'))
                     )
-                ))
+                    :
+                    array(new PHPParser_Node_Arg($value))
+            )
+        )),
+        'return'
+    ));
+}
+
+function generateTryCatchCall($expr, $state) {
+    return new PHPParser_Node_Stmt_TryCatch(
+        array(new PHPParser_Node_Stmt_Return(
+            new PHPParser_Node_Expr_FuncCall(new PHPParser_Node_Expr_Variable(CONT_NAME), array(
+                $expr
             ))
-        )
+        )),
+        array(new PHPParser_Node_Stmt_Catch(
+            new PHPParser_Node_Name('Exception'),
+            VALUE_NAME,
+            array(new PHPParser_Node_Stmt_Return(
+                new PHPParser_Node_Expr_FuncCall(
+                    new PHPParser_Node_Expr_ArrayDimFetch(
+                        new PHPParser_Node_Expr_Variable(EXCEPT_NAME),
+                        new PHPParser_Node_Scalar_LNumber($state->getCatchNum())
+                    ),
+                    array(new PHPParser_Node_Expr_Variable(VALUE_NAME))
+                )
+            ))
+        ))
     );
 }
 
 function generateMethodCall($object, $function, $args, $type, $state) {
-    // TODO handle dynamic method calls, magic methods, and try to figure out builtin classes
-    if ($function == '__construct') {
-        $function = INITIALIZE_NAME;
+    $is_builtin_call = in_array($function, $GLOBALS['MAGIC_METHODS']);
+    
+    $get_class = new PHPParser_Node_Expr_FuncCall(new PHPParser_Node_Name('get_class'), array($object));
+    if ($type == PHPParser_Node_Expr_StaticCall) {
+        if ($object->toString() == 'self') {
+            $object = $state->getSelf();
+        }
+        elseif ($object->toString() == 'parent') {
+            $object = $state->getParent();
+        }
+        
+        $get_class = new PHPParser_Node_Scalar_String($object->toString());
+        
+        if (isset($GLOBALS['CLASS_TO_BUILTIN_FUNCTIONS'][$object->toString()][$function])) {
+            $is_builtin_call = true;
+        }
     }
     
-    if (in_array($function, $GLOBALS['MAGIC_METHODS'])) { // builtins might be treated similarly
-        $stmt = new PHPParser_Node_Stmt_TryCatch(
-            array(new PHPParser_Node_Stmt_Return(
-                new PHPParser_Node_Expr_FuncCall(new PHPParser_Node_Expr_Variable(CONT_NAME), array(
-                    new $type($object, $function, $args)
-                ))
-            )),
-            array(new PHPParser_Node_Stmt_Catch(
-                new PHPParser_Node_Name('Exception'),
-                VALUE_NAME,
-                array(new PHPParser_Node_Stmt_Return(
-                    new PHPParser_Node_Expr_FuncCall(
-                        new PHPParser_Node_Expr_ArrayDimFetch(
-                            new PHPParser_Node_Expr_Variable(EXCEPT_NAME),
-                            new PHPParser_Node_Scalar_LNumber($state->getCatchNum())
-                        ),
-                        array(new PHPParser_Node_Expr_Variable(VALUE_NAME))
-                    )
-                ))
-            ))
-        );
+
+    if ($is_builtin_call) {
+        $stmt = generateTryCatchCall(new $type($object, $function, $args), $state);
     }
     else {
+        $orig_args = $args;
         array_unshift($args, $state->generateExceptParameter());
         array_unshift($args, new PHPParser_Node_Expr_Variable(CONT_NAME));
-        $stmt = new PHPParser_Node_Stmt_Return(new $type($object, $function, $args));
+        
+        $stmt = new PHPParser_Node_Stmt_If(
+            new PHPParser_Node_Expr_Isset(array(
+                new PHPParser_Node_Expr_ArrayDimFetch(
+                    new PHPParser_Node_Expr_ArrayDimFetch(
+                        new PHPParser_Node_Expr_ArrayDimFetch(
+                            new PHPParser_Node_Expr_Variable('GLOBALS'),
+                            new PHPParser_Node_Scalar_String('CLASS_TO_BUILTIN_METHODS')
+                        ),
+                        $get_class
+                    ),
+                    new PHPParser_Node_Scalar_String($function)
+                )
+            )),
+            array(
+                'stmts' => array(
+                    generateTryCatchCall(new $type($object, $function, $orig_args), $state)
+                ),
+                'else' => new PHPParser_Node_Stmt_Else(array(
+                    new PHPParser_Node_Stmt_Return(new $type($object, $function, $args))
+                ))
+            )
+        );
     }
     
-    return array(new PHPParser_Node_Stmt_Return(
-        new PHPParser_Node_Expr_Closure(array(
-            'uses' => array(
-                new PHPParser_Node_Expr_ClosureUse(CONT_NAME),
-                new PHPParser_Node_Expr_ClosureUse(EXCEPT_NAME),
-                new PHPParser_Node_Expr_ClosureUse(LOCALS_NAME, true),
-                new PHPParser_Node_Expr_ClosureUse(TEMP_NAME, true)
-            ),
-            'stmts' => array($stmt)
+    return array(generateThunk(
+        array(
+            new PHPParser_Node_Expr_ClosureUse(CONT_NAME),
+            new PHPParser_Node_Expr_ClosureUse(EXCEPT_NAME),
+            new PHPParser_Node_Expr_ClosureUse(LOCALS_NAME, true),
+            new PHPParser_Node_Expr_ClosureUse(TEMP_NAME, true)
+        ),
+        array($stmt),
+        'call'
+    ));
+}
+
+function wrapFunctionForCallback($function, $state) {
+    $user_call_stmts = array(new PHPParser_Node_Stmt_Return(
+        new PHPParser_Node_Expr_FuncCall(new PHPParser_Node_Name('call_user_func_array'), array(
+            new PHPParser_Node_Expr_Variable(VALUE_NAME),
+            new PHPParser_Node_Expr_FuncCall(new PHPParser_Node_Name('array_merge'), array(
+                new PHPParser_Node_Expr_Array(array(
+                    new PHPParser_Node_Expr_Variable(CONT_NAME),
+                    new PHPParser_Node_Expr_Variable(EXCEPT_NAME)
+                )),
+                new PHPParser_Node_Expr_ArrayDimFetch(
+                    new PHPParser_Node_Expr_Variable(TEMP_NAME),
+                    new PHPParser_Node_Scalar_String(ARGS_TEMP_NAME)
+                )
+            ))
         ))
+    ));
+    $function_transformer = new PHPParser_Node_Expr_ArrayDimFetch(
+        new PHPParser_Node_Expr_ArrayDimFetch(
+            new PHPParser_Node_Expr_Variable('GLOBALS'),
+            new PHPParser_Node_Scalar_String('BUILTIN_FUNCTIONS')
+        ),
+        new PHPParser_Node_Expr_Variable(VALUE_NAME)
+    );
+    $builtin_call_stmts = array(new PHPParser_Node_Stmt_Return(
+        new PHPParser_Node_Expr_FuncCall($function_transformer, array(
+            new PHPParser_Node_Expr_Variable(VALUE_NAME),
+            new PHPParser_Node_Expr_ArrayDimFetch(
+                new PHPParser_Node_Expr_Variable(TEMP_NAME),
+                new PHPParser_Node_Scalar_String(ARGS_TEMP_NAME)
+            ),
+            new PHPParser_Node_Expr_Variable(CONT_NAME),
+            $state->generateExceptParameter()
+        ))
+    ));
+    
+    // not a trampoline - this is the actual callback function that wraps the CPS callback - it takes parameters
+    return new PHPParser_Node_Expr_Closure(array(
+        'uses' => array(
+            new PHPParser_Node_Expr_ClosureUse(LOCALS_NAME, true),
+            new PHPParser_Node_Expr_ClosureUse(TEMP_NAME)
+        ),
+        'stmts' => array_merge(
+            array(
+                new PHPParser_Node_Expr_Assign(
+                    new PHPParser_Node_Expr_ArrayDimFetch(
+                        new PHPParser_Node_Expr_Variable(TEMP_NAME),
+                        new PHPParser_Node_Scalar_String(ARGS_TEMP_NAME)
+                    ),
+                    new PHPParser_Node_Expr_FuncCall(new PHPParser_Node_Name('func_get_args'))
+                )
+            ),
+            generateTrampoline(array(
+                new PHPParser_Node_Expr_Assign(new PHPParser_Node_Expr_Variable(VALUE_NAME), $function),
+                new PHPParser_Node_Stmt_If(
+                    new PHPParser_Node_Expr_BooleanAnd(
+                        new PHPParser_Node_Expr_FuncCall(new PHPParser_Node_Name('is_string'), array(new PHPParser_Node_Expr_Variable(VALUE_NAME))),
+                        new PHPParser_Node_Expr_FuncCall(new PHPParser_Node_Name('array_key_exists'), array(
+                            new PHPParser_Node_Expr_Variable(VALUE_NAME),
+                            new PHPParser_Node_Expr_ArrayDimFetch(
+                                new PHPParser_Node_Expr_Variable('GLOBALS'),
+                                new PHPParser_Node_Scalar_String('BUILTIN_FUNCTIONS')
+                            )
+                        ))
+                    ),
+                    array(
+                        'stmts' => $builtin_call_stmts,
+                        'else' => new PHPParser_Node_Stmt_Else($user_call_stmts)
+                    )
+                )
+            ))
+        )
     ));
 }
 
@@ -288,8 +425,18 @@ function generateFunctionCall($function, $args, $state) {
         $function_key = $function->toString();
     }
     
+    
     if ($function instanceof PHPParser_Node_Name) {
-        return $GLOBALS['STATIC_FUNCTION_TRANSFORM'][$function_key]($function, $args, $state);
+        if ($function_key) {
+            return $GLOBALS['STATIC_FUNCTION_TRANSFORM'][$function_key]($function, $args, $state);
+        }
+        else {
+            // if we have a null function key that means it's not a true builtin function
+            // we need to check builtin list at runtime in case it is a "fast" function
+            $callable_function = $function;
+            $function = new PHPParser_Node_Scalar_String($function->toString());
+            $assign_value = null;
+        }
     }
     elseif ($function instanceof PHPParser_Node_Expr_Closure) {
         $stmts = $GLOBALS['STATIC_FUNCTION_TRANSFORM'][$function_key](new PHPParser_Node_Expr_Variable(VALUE_NAME), $args, $state);
@@ -300,71 +447,81 @@ function generateFunctionCall($function, $args, $state) {
         return $stmts;
     }
     else {
-        $user_call_stmts = $GLOBALS['STATIC_FUNCTION_TRANSFORM'][null](new PHPParser_Node_Expr_Variable(VALUE_NAME), $args, $state);
-        $function_transformer = new PHPParser_Node_Expr_ArrayDimFetch(
+        $assign_value = new PHPParser_Node_Expr_Assign(
+            new PHPParser_Node_Expr_Variable(VALUE_NAME),
+            $function
+        );
+        $function = new PHPParser_Node_Expr_Variable(VALUE_NAME);
+        $callable_function = $function;
+    }
+    
+    $user_call_stmts = $GLOBALS['STATIC_FUNCTION_TRANSFORM'][null]($callable_function, $args, $state);
+    $function_transformer = new PHPParser_Node_Expr_ArrayDimFetch(
+        new PHPParser_Node_Expr_ArrayDimFetch(
+            new PHPParser_Node_Expr_Variable('GLOBALS'),
+            new PHPParser_Node_Scalar_String('BUILTIN_FUNCTIONS')
+        ),
+        $function
+    );
+    $builtin_call_stmts = array(new PHPParser_Node_Stmt_Return(
+        new PHPParser_Node_Expr_FuncCall($function_transformer, array(
+            $function,
+            new PHPParser_Node_Expr_Array(array_map(function ($arg) {
+                return new PHPParser_Node_Expr_ArrayItem($arg->value, null, isLValue($arg->value));
+            }, $args)),
+            new PHPParser_Node_Expr_Variable(CONT_NAME),
+            $state->generateExceptParameter()
+        ))
+    ));
+    
+    $conditions = new PHPParser_Node_Expr_FuncCall(new PHPParser_Node_Name('array_key_exists'),
+        array(
+            $function,
             new PHPParser_Node_Expr_ArrayDimFetch(
                 new PHPParser_Node_Expr_Variable('GLOBALS'),
                 new PHPParser_Node_Scalar_String('BUILTIN_FUNCTIONS')
-            ),
-            new PHPParser_Node_Expr_Variable(VALUE_NAME)
-        );
-        $builtin_call_stmts = array(new PHPParser_Node_Stmt_Return(
-            new PHPParser_Node_Expr_FuncCall($function_transformer, array(
-                new PHPParser_Node_Expr_Variable(VALUE_NAME),
-                new PHPParser_Node_Expr_Array(array_map(function ($arg) {
-                    return new PHPParser_Node_Expr_ArrayItem($arg->value, null, isLValue($arg->value));
-                }, $args)),
-                new PHPParser_Node_Expr_Variable(CONT_NAME),
-                $state->generateExceptParameter()
-            ))
-        ));
-        return array(
-            new PHPParser_Node_Expr_Assign(
-                new PHPParser_Node_Expr_Variable(VALUE_NAME),
-                $function
-            ),
-            new PHPParser_Node_Stmt_If(
-                new PHPParser_Node_Expr_BooleanAnd(
-                    new PHPParser_Node_Expr_FuncCall(new PHPParser_Node_Name('is_string'), array(new PHPParser_Node_Expr_Variable(VALUE_NAME))),
-                    new PHPParser_Node_Expr_FuncCall(new PHPParser_Node_Name('array_key_exists'),
-                        array(
-                            new PHPParser_Node_Expr_Variable(VALUE_NAME),
-                            new PHPParser_Node_Expr_ArrayDimFetch(
-                                new PHPParser_Node_Expr_Variable('GLOBALS'),
-                                new PHPParser_Node_Scalar_String('BUILTIN_FUNCTIONS')
-                            )
-                        )
-                    )
-                ), array(
-                    'stmts' => $builtin_call_stmts,
-                    'else' => new PHPParser_Node_Stmt_Else($user_call_stmts)
-                )
             )
+        )
+    );
+    if (!($function instanceof PHPParser_Node_Scalar_String)) {
+        $conditions = new PHPParser_Node_Expr_BooleanAnd(
+            new PHPParser_Node_Expr_FuncCall(new PHPParser_Node_Name('is_string'), array($function)),
+            $conditions
         );
     }
+    
+    $stmts = array(new PHPParser_Node_Stmt_If($conditions, array(
+        'stmts' => $builtin_call_stmts,
+        'else' => new PHPParser_Node_Stmt_Else($user_call_stmts)
+    )));
+    
+    if ($assign_value) {
+        array_unshift($stmts, $assign_value);
+    }
+    
+    return $stmts;
 }
 
 function generateJump($label_num) {
-    return new PHPParser_Node_Stmt_Return(
-        new PHPParser_Node_Expr_Closure(array(
-            'uses' => array(
-                new PHPParser_Node_Expr_ClosureUse(LOCALS_NAME),
-                new PHPParser_Node_Expr_ClosureUse(TEMP_NAME, true),
-                new PHPParser_Node_Expr_ClosureUse(LABELS_NAME, true)
-            ),
-            'stmts' => array(new PHPParser_Node_Stmt_Return(
-                new PHPParser_Node_Expr_FuncCall(
-                    new PHPParser_Node_Expr_ArrayDimFetch(
-                        new PHPParser_Node_Expr_Variable(LABELS_NAME),
-                        new PHPParser_Node_Scalar_LNumber($label_num)
-                    ),
-                    array(
-                        new PHPParser_Node_Arg(new PHPParser_Node_Expr_Variable(LOCALS_NAME)),
-                        new PHPParser_Node_Arg(new PHPParser_Node_Expr_Variable(TEMP_NAME))
-                    )
+    return generateThunk(
+        array(
+            new PHPParser_Node_Expr_ClosureUse(LOCALS_NAME),
+            new PHPParser_Node_Expr_ClosureUse(TEMP_NAME, true),
+            new PHPParser_Node_Expr_ClosureUse(LABELS_NAME, true)
+        ),
+        array(new PHPParser_Node_Stmt_Return(
+            new PHPParser_Node_Expr_FuncCall(
+                new PHPParser_Node_Expr_ArrayDimFetch(
+                    new PHPParser_Node_Expr_Variable(LABELS_NAME),
+                    new PHPParser_Node_Scalar_LNumber($label_num)
+                ),
+                array(
+                    new PHPParser_Node_Arg(new PHPParser_Node_Expr_Variable(LOCALS_NAME)),
+                    new PHPParser_Node_Arg(new PHPParser_Node_Expr_Variable(TEMP_NAME))
                 )
-            ))
-        ))
+            )
+        )),
+        'jump'
     );
 }
 
@@ -395,6 +552,59 @@ class FunctionState {
     private $label_names = array();
     private $catch_num = 0;
     private $catches = array();
+    private $self = null;
+    private $parent = null;
+    private $builtin_methods = array();
+    private $is_in_instance_method = false;
+
+    function setIsInInstanceMethod($is_in_instance_method) {
+        $this->is_in_instance_method = $is_in_instance_method;
+    }
+    
+    function isInInstanceMethod() {
+        return $this->is_in_instance_method;
+    }
+
+    function addBuiltinMethod($name) {
+        $this->builtin_methods[$name] = true;
+    }
+
+    function generateBuiltinMethodDeclarations() {
+        return array(new PHPParser_Node_Expr_Assign(
+            new PHPParser_Node_Expr_ArrayDimFetch(
+                new PHPParser_Node_Expr_ArrayDimFetch(
+                    new PHPParser_Node_Expr_Variable('GLOBALS'),
+                    new PHPParser_Node_Scalar_String('CLASS_TO_BUILTIN_METHODS')
+                ),
+                new PHPParser_Node_Scalar_String($this->getSelf())
+            ),
+            new PHPParser_Node_Expr_Array(array_map(
+                function($method_name) {
+                    return new PHPParser_Node_Expr_ArrayItem(
+                        new PHPParser_Node_Expr_ConstFetch(new PHPParser_Node_Name('true')),
+                        new PHPParser_Node_Scalar_String($method_name)
+                    );
+                },
+                array_keys($this->builtin_methods)
+            ))
+        ));
+    }
+
+    function setSelf($self) {
+        $this->self = $self;
+    }
+
+    function getSelf() {
+        return $this->self;
+    }
+
+    function setParent($parent) {
+        $this->parent = $parent;
+    }
+
+    function getParent() {
+        return $this->parent;
+    }
 
     function setIsReturnByRef($is_return_by_ref = true) {
         $this->is_return_by_ref = $is_return_by_ref;
@@ -447,24 +657,24 @@ class FunctionState {
     function generateThrow($exception) {
         $stmts = array();
         $exception = assignToTemp($exception, $stmts);
-        $stmts[] = new PHPParser_Node_Stmt_Return(
-            new PHPParser_Node_Expr_Closure(array(
-                'uses' => array(
-                    new PHPParser_Node_Expr_ClosureUse(EXCEPT_NAME),
-                    new PHPParser_Node_Expr_ClosureUse(TEMP_NAME)
-                ),
-                'stmts' => array(
-                    new PHPParser_Node_Stmt_Return(
-                        new PHPParser_Node_Expr_FuncCall(
-                            new PHPParser_Node_Expr_ArrayDimFetch(
-                                new PHPParser_Node_Expr_Variable(EXCEPT_NAME),
-                                new PHPParser_Node_Scalar_LNumber($this->catch_num)
-                            ),
-                            array($exception)
-                        )
+        // trampoline
+        $stmts[] = generateThunk(
+            array(
+                new PHPParser_Node_Expr_ClosureUse(EXCEPT_NAME),
+                new PHPParser_Node_Expr_ClosureUse(TEMP_NAME)
+            ),
+            array(
+                new PHPParser_Node_Stmt_Return(
+                    new PHPParser_Node_Expr_FuncCall(
+                        new PHPParser_Node_Expr_ArrayDimFetch(
+                            new PHPParser_Node_Expr_Variable(EXCEPT_NAME),
+                            new PHPParser_Node_Scalar_LNumber($this->catch_num)
+                        ),
+                        array($exception)
                     )
                 )
-            ))
+            ),
+            'throw'
         );
         return $stmts;
     }
@@ -524,7 +734,7 @@ class FunctionState {
                 ),
                 new PHPParser_Node_Expr_Closure(array(
                     'params' => array(
-                        new PHPParser_Node_Param(LOCALS_NAME),
+                        new PHPParser_Node_Param(LOCALS_NAME, null, null, true),
                         new PHPParser_Node_Param(TEMP_NAME, null, null, true)
                     ),
                     'uses' => array(
@@ -590,18 +800,14 @@ function traverseStatements($stmts, $final, $after_stmts, $state, $is_top_level 
     if ($stmts === null) { // This is for functions in interfaces, but probably need to do it differently TODO
         return $final(null, $state);
     }
-    
-    if (!is_array($stmts)) {
-        throw new Exception('wtf');
-    }
 
     // Hoist functions (and classes, even though PHP doesn't exactly do so)
     $functions = array();
     $statements = array();
     foreach ($stmts as $stmt) {
-        if ($stmt instanceof PHPParser_Node_Stmt_Function ||
+        if ($stmt instanceof PHPParser_Node_Stmt_Function/* ||
             $stmt instanceof PHPParser_Node_Stmt_Class ||
-            $stmt instanceof PHPParser_Node_Stmt_Interface)
+            $stmt instanceof PHPParser_Node_Stmt_Interface*/)
         {
             $functions[] = $stmt;
         }
@@ -634,7 +840,6 @@ function traverseStatements($stmts, $final, $after_stmts, $state, $is_top_level 
             return $final($after_stmts, $state);
         }
     }, function ($result, $state) use ($final, $is_top_level) {
-        if (!is_array($result)) throw new Exception('wtf');
         if ($is_top_level) {
             $result = array_merge($state->generateBasicBlocks(), $state->generateCatches(), $result);
         }
@@ -689,7 +894,28 @@ function traverseNode($node, $next, $final, $state) {
         $GLOBALS['compiler_halt_offset'] = $offset;
         return $final(generateReturn(new PHPParser_Node_Expr_ConstFetch(new PHPParser_Node_Name('null')), $state), $state);
     }
-    elseif ($node === null || is_string($node) || $node instanceof PHPParser_Node_Scalar || $node instanceof PHPParser_Node_Expr_ConstFetch || $node instanceof PHPParser_Node_Name || $node instanceof PHPParser_Node_Stmt_InlineHTML) {
+    elseif ($node instanceof PHPParser_Node_Stmt_Const) {
+        return call_user_func($loop = function ($consts, $compiled_consts, $final, $state) use (&$loop, $next) {
+            if ($const = array_shift($consts)) {
+                return traverseNode($const->value, function ($const_value, $final, $state) use ($const, $consts, &$loop) {
+                    $compiled_consts[] = new PHPParser_Node_Expr_FuncCall(new PHPParser_Node_Name('define'), array(
+                        new PHPParser_Node_Scalar_String($const->name),
+                        $const_value
+                    ));
+                    return function () use (&$loop, $consts, $compiled_consts, $final, $state) {
+                        return $loop($consts, $compiled_consts, $final, $state);
+                    };
+                }, $final, $state);
+            }
+            else {
+                return $next($compiled_consts, $final, $state);
+            }
+        }, $node->consts, array(), $final, $state);
+    }
+    elseif ($node instanceof PHPParser_Node_Expr_ConstFetch) {
+        return $next($node, $final, $state);
+    }
+    elseif ($node === null || is_string($node) || $node instanceof PHPParser_Node_Scalar || $node instanceof PHPParser_Node_Name || $node instanceof PHPParser_Node_Stmt_InlineHTML) {
         return $next($node, $final, $state);
     }
     elseif ($node instanceof PHPParser_Node_Stmt_While) {
@@ -714,13 +940,84 @@ function traverseNode($node, $next, $final, $state) {
             return $final(array(generateJump($continue_num)), $state);
         }, $state);
     }
+    elseif ($node instanceof PHPParser_Node_Stmt_Do) {
+        $continue_num = $state->generateBlockNum();
+        $break_num = $state->generateBlockNum();
+        $body_num = $state->generateBlockNum();
+        
+        return traverseNode($node->cond, function ($cond, $final, $state) use ($node, $next, $continue_num, $break_num, $body_num) {
+            return traverseStatements($node->stmts, function ($do_body) use ($cond, $next, $continue_num, $break_num, $body_num, $final, $state) {
+                $state->addBasicBlock($body_num, $do_body);
+            
+                return $next(null, function ($after_do, $state) use ($break_num, $continue_num, $body_num, $do_body, $cond, $final) {
+                    $state->addBasicBlock($break_num, $after_do);
+                    
+                    return $final(array(
+                        new PHPParser_Node_Stmt_If($cond,
+                            array('stmts' => array(generateJump($body_num)))
+                        ),
+                        generateJump($break_num)
+                    ), $state);
+                }, $state);
+            }, array(generateJump($continue_num)), $state->addBreakAndContinue($break_num, $continue_num));
+        }, function ($cond_block, $state) use ($final, $continue_num, $body_num) {
+            $state->addBasicBlock($continue_num, $cond_block);
+            return $final(array(generateJump($body_num)), $state);
+        }, $state);
+    }
+    elseif ($node instanceof PHPParser_Node_Stmt_For) {
+        $continue_num = $state->generateBlockNum();
+        $break_num = $state->generateBlockNum();
+        
+        return traverseStatements($node->init, function ($init) use ($node, $continue_num, $break_num, $state, $next, $final) {
+            $cond = $node->cond;
+            $cond_var = generateTemp();
+            if (count($cond)) {
+                $cond[] = new PHPParser_Node_Expr_Assign($cond_var, array_pop($cond));
+            }
+            
+            return call_user_func($cond_loop = function ($conds, $compiled_conds, $state) use (&$cond_loop, $node, $next, $final, $continue_num, $break_num, $init) {
+                if ($cond = array_shift($conds)) {
+                    return traverseNode($cond, function ($cond, $final, $state) use (&$cond_loop, $conds, $compiled_conds) {
+                        $compiled_conds[] = $cond;
+                        return function () use (&$cond_loop, $conds, $compiled_conds, $state) {
+                            return $cond_loop($conds, $compiled_conds, $state);
+                        };
+                    }, $final, $state);
+                }
+                else {
+                    return traverseStatements($node->loop, function ($loop) use ($node, $state, $break_num, $continue_num, $compiled_conds, $next, $final, $init) {
+                        return traverseStatements($node->stmts, function ($for_body) use ($state, $continue_num, $break_num, $compiled_conds, $next, $final, $init) {
+                            if (count($compiled_conds)) {
+                                $last_cond = array_pop($compiled_conds);
+                                $for_body = array_merge($compiled_conds, array(
+                                    new PHPParser_Node_Stmt_If($last_cond, array(
+                                        'stmts' => $for_body
+                                    ))
+                                ));
+                            }
+                            $for_body[] = generateJump($break_num);
+                            $state->addBasicBlock($continue_num, $for_body);
+                            
+                            return $next(null, function ($after_for, $state) use ($break_num, $final, $init) {
+                                $state->addBasicBlock($break_num, $after_for);
+                                
+                                return $final($init, $state);
+                            }, $state);
+                        }, $loop, $state->addBreakAndContinue($break_num, $continue_num));
+                    }, array(generateJump($continue_num)), $state);
+                }
+            }, $node->cond, array(), $state);
+        }, array(generateJump($continue_num)), $state);
+    }
     elseif ($node instanceof PHPParser_Node_Stmt_Foreach) {
-        // TODO handle byref and non-array Traversables
+        // TODO handle non-array Traversables
         $continue_num = $state->generateBlockNum();
         $break_num = $state->generateBlockNum();
         return traverseNode($node->expr, function ($expr, $final, $state) use ($continue_num, $break_num, $node, $next) {
             $stmts = array();
-            $temp = assignToTemp($expr, $stmts);
+            $temp = assignToTemp($expr, $stmts, $node->byRef);
+            $stmts[] = new PHPParser_Node_Expr_FuncCall(new PHPParser_Node_Name('reset'), array($temp));
             
             return traverseStatements($node->stmts, function ($foreach_body) use ($final, $state, $node, $next, $continue_num, $break_num, $stmts, $temp) {
                 return traverseNode($node->keyVar, function ($keyVar, $final, $state) use ($foreach_body, $node, $next, $break_num, $temp) {
@@ -728,10 +1025,23 @@ function traverseNode($node, $next, $final, $state) {
                         return $next(null, function ($after_foreach, $state) use ($break_num, $foreach_body, $temp, $final, $keyVar, $valueVar) {
                             $state->addBasicBlock($break_num, $after_foreach);
                             
+                            $keyTemp = generateTemp();
+                            
+                            array_unshift($foreach_body, new PHPParser_Node_Expr_AssignRef(
+                                $valueVar,
+                                new PHPParser_Node_Expr_ArrayDimFetch($temp, $keyTemp)
+                            ));
+                            if ($keyVar) {
+                                array_unshift($foreach_body, new PHPParser_Node_Expr_Assign(
+                                    $keyVar,
+                                    $keyTemp
+                                ));
+                            }
+                            
                             $foreach_body = array(
                                 new PHPParser_Node_Stmt_If(
                                     new PHPParser_Node_Expr_AssignList(
-                                        array($keyVar, $valueVar),
+                                        array($keyTemp, null),
                                         new PHPParser_Node_Expr_FuncCall(new PHPParser_Node_Name('each'), array($temp))
                                     ),
                                     array('stmts' => $foreach_body)
@@ -767,27 +1077,25 @@ function traverseNode($node, $next, $final, $state) {
                 // Handle zero or more elseif blocks
                 $elseifs = $node->elseifs;
                 $else = $node->else;
-                return call_user_func($loop = function ($next_num, $elseifs, $state) use (&$loop, $done_num, $else, $final, $if_body) {
+                return call_user_func($loop = function ($next_num, $elseifs, $final, $state) use (&$loop, $done_num, $else, $if_body) {
                     if (isset($elseifs) && $elseif = array_shift($elseifs)) {
                         $elseif_num = $next_num;
                         $next_num = $done_num;
                         if (count($elseifs) > 0 || isset($else)) {
                             $next_num = $state->generateBlockNum();
                         }
-                        return traverseNode($elseif->cond, function ($cond, $final, $state) use (&$loop, $elseif, $elseif_num, $next_num, $done_num) {
-                            return traverseStatements($elseif->stmts, function ($elseif_body, $state) use (&$loop, $elseif_num, $next_num, $cond) {
+                        return traverseNode($elseif->cond, function ($cond, $final, $state) use (&$loop, $elseif, $elseif_num, $next_num, $done_num, $elseifs) {
+                            return traverseStatements($elseif->stmts, function ($elseif_body, $state) use (&$loop, $elseif_num, $next_num, $cond, $elseifs, $final) {
                                 $elseif_body = array(
                                     new PHPParser_Node_Stmt_If($cond, array('stmts' => $elseif_body)),
                                     generateJump($next_num)
                                 );
-                                return function () use (&$loop, $next_num, $elseifs, $state) {
-                                    return $loop($next_num, $elseifs, $state);
+                                $state->addBasicBlock($elseif_num, $elseif_body);
+                                return function () use (&$loop, $next_num, $elseifs, $final, $state) {
+                                    return $loop($next_num, $elseifs, $final, $state);
                                 };
                             }, array(generateJump($done_num)), $state);
-                        }, function ($elseif_body, $state) use (&$loop, $elseif_num, $elseifs) {
-                            $state->addBasicBlock($elseif_num, $elseif_body);
-                            return $loop($next_num, $elseifs, $state);
-                        }, $state);
+                        }, $final, $state);
                     }
                     elseif (isset($else)) {
                         return traverseStatements($else->stmts, function ($else_body, $state) use ($next_num, $if_body, $final) {
@@ -798,7 +1106,7 @@ function traverseNode($node, $next, $final, $state) {
                     else {
                         return $final($if_body, $state);
                     }
-                }, $next_num, $elseifs, $state);
+                }, $next_num, $elseifs, $final, $state);
             }, array(generateJump($done_num)), $state);
         }, function ($if_body, $state) use ($final, $done_num, $next) {
             return $next(null, function ($after_if, $state) use ($done_num, $final, $if_body) {
@@ -833,6 +1141,14 @@ function traverseNode($node, $next, $final, $state) {
             return $final(array($state->getLabel($name)), $state);
         }, $state);
     }
+    elseif ($node instanceof PHPParser_Node_Expr_Exit) {
+        return traverseNode($node->expr, function ($expr, $final, $state) use ($next) {
+            return $next(null, function ($stmts_x, $state_x) use ($expr, $state, $final) {
+                // Executable statements after exit() are not reached, but we run the compiler over them anyway.
+                return $final(array(new PHPParser_node_Expr_Exit($expr)), $state);
+            }, $state);
+        }, $final, $state);
+    }
     elseif ($node instanceof PHPParser_Node_Stmt_Return) {
         return traverseNode($node->expr, new ReturnClosure(function ($expr, $final, $state) use ($next) {
             return $next(null, function ($stmts_x, $state_x) use ($expr, $state, $final) {
@@ -856,16 +1172,16 @@ function traverseNode($node, $next, $final, $state) {
                         };
                     }
                     else {
-                        return $final(array(new PHPParser_Node_Stmt_Return(
-                            new PHPParser_Node_Expr_Closure(array(
-                                'uses' => array(
-                                    new PHPParser_Node_Expr_ClosureUse(CONT_NAME),
-                                    new PHPParser_Node_Expr_ClosureUse(EXCEPT_NAME),
-                                    new PHPParser_Node_Expr_ClosureUse(LOCALS_NAME, true),
-                                    new PHPParser_Node_Expr_ClosureUse(TEMP_NAME)
-                                ),
-                                'stmts' => generateFunctionCall($function, $compiled_args, $state)
-                            ))
+                        // trampoline
+                        return $final(array(generateThunk(
+                            array(
+                                new PHPParser_Node_Expr_ClosureUse(CONT_NAME),
+                                new PHPParser_Node_Expr_ClosureUse(EXCEPT_NAME),
+                                new PHPParser_Node_Expr_ClosureUse(LOCALS_NAME, true),
+                                new PHPParser_Node_Expr_ClosureUse(TEMP_NAME)
+                            ),
+                            generateFunctionCall($function, $compiled_args, $state),
+                            'call'
                         )), $state);
                     }
                 }, $final, 0, array(), $state);
@@ -880,6 +1196,24 @@ function traverseNode($node, $next, $final, $state) {
         
         $new_state = new FunctionState();
         $new_state->setIsReturnByRef($node->byRef);
+        
+        // Provide a way to escape from CPS if a function doesn't need it.
+        if (count($node->stmts) &&
+            $node->stmts[0] instanceof PHPParser_Node_Scalar_String &&
+            $node->stmts[0]->value == 'fast')
+        {
+            // "fast" pragma to treat this function as a builtin
+            // this promises that the function does not call any non-fast functions
+            __cps_add_builtin($node->name);
+            array_shift($node->stmts); // drop the pragma
+            return $next(array(
+                $node,
+                new PHPParser_Node_Expr_FuncCall(new PHPParser_Node_Name('__cps_add_builtin'), array(
+                    new PHPParser_Node_Scalar_String($node->name)
+                ))
+            ), $final, $state);
+        }
+        
         return traverseStatements($node->stmts, function ($result, $new_state) use ($next, $final, $name, $params, $param_items, $byRef, $state) {
             $result = array_merge(
                 array(
@@ -897,16 +1231,26 @@ function traverseNode($node, $next, $final, $state) {
                     )
                 ),
                 $result);
-            return $next(new PHPParser_Node_Stmt_Function($name, array(
+            $result = new PHPParser_Node_Stmt_Function($name, array(
                 'params' => $params,
                 'stmts' => $result
-            )), $final, $state);
+            ));
+            
+            return $next($result, $final, $state);
         }, generateReturn(new PHPParser_Node_Expr_ConstFetch(new PHPParser_Node_Name('null')), $new_state), $new_state, true);
     }
     elseif ($node instanceof PHPParser_Node_Expr_Closure) {
         generateParams($node->params, $params, $param_items);
         array_unshift($params, new PHPParser_Node_Param(EXCEPT_NAME));
         array_unshift($params, new PHPParser_Node_Param(CONT_NAME));
+        
+        if ($state->isInInstanceMethod()) {
+            $param_items[] = new PHPParser_Node_Expr_ArrayItem(
+                new PHPParser_Node_Expr_Variable('this'),
+                new PHPParser_Node_Scalar_String('this'),
+                true
+            );
+        }
         
         $uses = array();
         foreach ($node->uses as $use) {
@@ -923,7 +1267,10 @@ function traverseNode($node, $next, $final, $state) {
         );
         
         $new_state = new FunctionState();
+        $new_state->setSelf($state->getSelf());
+        $new_state->setParent($state->getParent());
         $new_state->setIsReturnByRef($node->byRef);
+        $new_state->setIsInInstanceMethod($state->isInInstanceMethod());
         return traverseStatements($node->stmts, function ($result, $new_state) use ($param_items, $next, $final, $uses, $params, $state) {
             $result = array_merge(
                 array(
@@ -1040,7 +1387,8 @@ function traverseNode($node, $next, $final, $state) {
         $node instanceof PHPParser_Node_Expr_Print ||
         $node instanceof PHPParser_Node_Expr_UnaryMinus ||
         $node instanceof PHPParser_Node_Expr_UnaryPlus ||
-        $node instanceof PHPParser_Node_Expr_Cast)
+        $node instanceof PHPParser_Node_Expr_Cast ||
+        $node instanceof PHPParser_Node_Expr_Clone)
     {
         $node_class = get_class($node);
         return traverseNode($node->expr, function ($result, $final, $state) use ($node_class, $next) {
@@ -1286,6 +1634,13 @@ function traverseNode($node, $next, $final, $state) {
             ), $final, $state);
         }, $final, $state);
     }
+    elseif ($node instanceof PHPParser_Node_Expr_Instanceof) {
+        return traverseNode($node->expr, function ($expr, $final, $state) use ($next, $node) {
+            return traverseNode($node->class, function ($class, $final, $state) use ($next, $expr) {
+                return $next(new PHPParser_Node_Expr_Instanceof($expr, $class), $final, $state);
+            }, $final, $state);
+        }, $final, $state);
+    }
     elseif ($node instanceof PHPParser_Node_Stmt_Interface) {
         return traverseStatements($node->stmts, function ($stmts, $new_state) use ($final, $next, $state, $node) {
             return $next(new PHPParser_Node_Stmt_Interface(
@@ -1298,104 +1653,30 @@ function traverseNode($node, $next, $final, $state) {
         }, array(), new FunctionState(), true);
     }
     elseif ($node instanceof PHPParser_Node_Stmt_Class) {
-        return traverseStatements($node->stmts, function ($stmts, $new_state) use ($final, $next, $state, $node) {
-            $initialize_method = null;
-            $has_allocate = false;
-            $has_new = false;
-            foreach ($stmts as $stmt) {
-                if ($stmt instanceof PHPParser_Node_Stmt_ClassMethod) {
-                    switch ($stmt->name) {
-                        case INITIALIZE_NAME:
-                            $initialize_method = $stmt;
-                            break;
-                        case NEW_NAME:
-                            $has_new = true;
-                            break;
-                        case ALLOCATE_NAME:
-                            $has_allocate = true;
-                            break;
-                    }
-                }
-            }
-            // Emit an "allocate" magic method.
-            if (!$has_allocate) {
-                $stmts[] = new PHPParser_Node_Stmt_ClassMethod(new PHPParser_Node_Name(ALLOCATE_NAME), array(
-                    'type' => ($initialize_method ? $initialize_method->type : 0) | PHPParser_Node_Stmt_Class::MODIFIER_STATIC,
-                    'params' => array(new PHPParser_Node_Param(CONT_NAME), new PHPParser_Node_Param(EXCEPT_NAME)),
-                    'stmts' => array(new PHPParser_Node_Stmt_TryCatch(
-                        array(new PHPParser_Node_Stmt_Return( // TODO return thunk?
-                            new PHPParser_Node_Expr_FuncCall(
-                                new PHPParser_Node_Expr_Variable(CONT_NAME), array(
-                                    new PHPParser_Node_Expr_New(new PHPParser_Node_Name($node->name))
-                                )
-                            )
-                        )),
-                        array(new PHPParser_Node_Stmt_Catch(
-                            new PHPParser_Node_Name('Exception'),
-                            VALUE_NAME,
-                            array(new PHPParser_Node_Expr_FuncCall(
-                                new PHPParser_Node_Expr_ArrayDimFetch(
-                                    new PHPParser_Node_Expr_Variable(EXCEPT_NAME),
-                                    new PHPParser_Node_Scalar_LNumber($state->getCatchNum())
-                                ),
-                                array(new PHPParser_Node_Expr_Variable(VALUE_NAME))
-                            ))
-                        ))
-                    ))
-                ));
-            }
-            // Emit a "new" magic method
-            if (!$has_new) {
-                if ($initialize_method) {
-                    $init_params = array_map(function ($param) {
-                        return new PHPParser_Node_Arg(new PHPParser_Node_Expr_Variable($param->name));
-                    }, $initialize_method->params);
-                    array_shift($init_params); // remove continuation
-                    array_unshift($init_params, new PHPParser_Node_Expr_Closure(array(
-                        'uses' => array(
-                            new PHPParser_Node_Expr_ClosureUse(CONT_NAME),
-                            new PHPParser_Node_Expr_ClosureUse(VALUE_NAME)
-                        ),
-                        'stmts' => array(new PHPParser_Node_Stmt_Return(
-                            new PHPParser_Node_Expr_FuncCall(new PHPParser_Node_Expr_Variable(CONT_NAME), array(
-                                new PHPParser_Node_Expr_Variable(VALUE_NAME)
-                            ))
-                        ))
-                    )));
-                    $stmts[] = new PHPParser_Node_Stmt_ClassMethod(NEW_NAME, array(
-                        'type' => $initialize_method->type | PHPParser_Node_Stmt_Class::MODIFIER_STATIC,
-                        'params' => $initialize_method->params,
-                        'stmts' => array(new PHPParser_Node_Stmt_Return(
-                            new PHPParser_Node_Expr_StaticCall(new PHPParser_Node_Name('self'), ALLOCATE_NAME, array(
-                                new PHPParser_Node_Expr_Closure(array(
-                                    'params' => array(new PHPParser_Node_Param(VALUE_NAME)),
-                                    'uses' => array_map(function ($param) {
-                                            return new PHPParser_Node_Expr_ClosureUse($param->name);
-                                        }, $initialize_method->params),
-                                    'stmts' => array(new PHPParser_Node_Stmt_Return(
-                                        new PHPParser_Node_Expr_MethodCall(new PHPParser_Node_Expr_Variable(VALUE_NAME), INITIALIZE_NAME, $init_params)
-                                    ))
-                                )),
-                                new PHPParser_Node_Expr_Variable(EXCEPT_NAME)
-                            ))
-                        ))
-                    ));
-                }
-                else { // emit a do-nothing new
-                    $stmts[] = new PHPParser_Node_Stmt_ClassMethod(new PHPParser_Node_Name(NEW_NAME), array(
-                        'type' => PHPParser_Node_Stmt_Class::MODIFIER_STATIC,
-                        'params' => array(new PHPParser_Node_Param(CONT_NAME), new PHPParser_Node_Param(EXCEPT_NAME)),
-                        'stmts' => array(new PHPParser_Node_Stmt_Return( // TODO return thunk?
-                            new PHPParser_Node_Expr_StaticCall(new PHPParser_Node_Name('self'), ALLOCATE_NAME, array(
-                                new PHPParser_Node_Arg(new PHPParser_Node_Expr_Variable(CONT_NAME)),
-                                new PHPParser_Node_Arg(new PHPParser_Node_Expr_Variable(EXCEPT_NAME))
-                            ))
-                        ))
-                    ));
+        $new_state = new FunctionState();
+        $new_state->setSelf($node->name);
+        $new_state->setParent($node->extends);
+
+        $builtin_methods = array();
+        if ($node->extends && array_key_exists($node->extends->toString(), $GLOBALS['CLASS_TO_BUILTIN_METHODS'])) {
+            $builtin_methods = $GLOBALS['CLASS_TO_BUILTIN_METHODS'][$node->extends->toString()];
+            
+            $GLOBALS['CLASS_TO_BUILTIN_METHODS'][$node->name] = $builtin_methods;
+            // Find non-builtins that are defined in this class
+            foreach ($node->stmts as $method) {
+                if ($method instanceof PHPParser_Node_Stmt_ClassMethod) {
+                    unset($GLOBALS['CLASS_TO_BUILTIN_METHODS'][$node->name][$method->name]);
                 }
             }
             
-            return $next(new PHPParser_Node_Stmt_Class(
+            foreach ($GLOBALS['CLASS_TO_BUILTIN_METHODS'][$node->name] as $method_name => $junk) {
+                $new_state->addBuiltinMethod($method_name);
+            }
+        }
+
+        return traverseStatements($node->stmts, function ($stmts, $new_state) use ($final, $next, $state, $node) {
+            $result = $new_state->generateBuiltinMethodDeclarations();
+            $result[] = new PHPParser_Node_Stmt_Class(
                 $node->name,
                 array(
                     'type' => $node->type,
@@ -1403,16 +1684,24 @@ function traverseNode($node, $next, $final, $state) {
                     'implements' => $node->implements,
                     'stmts' => $stmts
                 )
-            ), $final, $state);
-        }, array(), new FunctionState(), true);
+            );
+            return $next($result, $final, $state);
+        }, array(), $new_state, true);
     }
     elseif ($node instanceof PHPParser_Node_Stmt_ClassMethod) {
+        if (count($node->stmts) &&
+            $node->stmts[0] instanceof PHPParser_Node_Scalar_String &&
+            $node->stmts[0]->value == 'fast')
+        {
+            array_shift($node->stmts);
+            __cps_add_builtin_method($state->getSelf(), $node->name);
+            $state->addBuiltinMethod($node->name);
+            return $next($node, $final, $state);
+        }
+    
         generateParams($node->params, $params, $param_items);
         
         $name = $node->name;
-        if ($name == '__construct') {
-            $name = INITIALIZE_NAME;
-        }
         
         $should_trampoline = false;
         if (in_array($name, $GLOBALS['MAGIC_METHODS'])) {
@@ -1422,8 +1711,13 @@ function traverseNode($node, $next, $final, $state) {
             array_unshift($params, new PHPParser_Node_Param(EXCEPT_NAME));
             array_unshift($params, new PHPParser_Node_Param(CONT_NAME));
         }
+        
         $new_state = new FunctionState();
+        $new_state->setSelf($state->getSelf());
+        $new_state->setParent($state->getParent());
         $new_state->setIsReturnByRef($node->byRef);
+        $new_state->setIsInInstanceMethod(!($node->type & PHPParser_Node_Stmt_Class::MODIFIER_STATIC));
+        
         return traverseStatements($node->stmts, function ($result, $new_state) use ($next, $final, $state, $node, $name, $params, $param_items, $should_trampoline) {
             if (isset($result)) {
                 if ($should_trampoline) {
@@ -1451,7 +1745,8 @@ function traverseNode($node, $next, $final, $state) {
             return $next(new PHPParser_Node_Stmt_ClassMethod($name, array(
                 'type' => $node->type,
                 'params' => $params,
-                'stmts' => $result
+                'stmts' => $result,
+                'byRef' => $should_trampoline && $new_state->getIsReturnByRef()
             )), $final, $state);
         }, generateReturn(new PHPParser_Node_Expr_ConstFetch(new PHPParser_Node_Name('null')), $new_state), $new_state, true);
     }
@@ -1479,14 +1774,12 @@ function traverseNode($node, $next, $final, $state) {
         }, $state);
     }
     elseif ($node instanceof PHPParser_Node_Expr_New) {
-        // TODO handle builtin classes and dynamic class names
-        
         return generateContinuation($next, function ($continuation, $state) use ($final, $node) {
             return traverseNode($node->class, function ($class, $final, $state) use ($node) {
                 return call_user_func($loop = function ($args, $compiled_args, $final, $state) use (&$loop, $class) {
                     if ($arg = array_shift($args)) {
                         $byRef = $arg->byRef;
-                        return traverseNode($arg->value, function ($arg, $final, $state) use (&$loop, $args, $compiled_args, $byRef) {
+                        return traverseNode($arg->value, function ($arg, $final, $state) use (&$loop, $args, $byRef, $compiled_args) {
                             $compiled_args[] = new PHPParser_Node_Arg($arg, $byRef);
                             return function () use (&$loop, $args, $compiled_args, $final, $state) {
                                 return $loop($args, $compiled_args, $final, $state);
@@ -1494,19 +1787,16 @@ function traverseNode($node, $next, $final, $state) {
                         }, $final, $state);
                     }
                     else {
-                        array_unshift($compiled_args, $state->generateExceptParameter());
-                        array_unshift($compiled_args, new PHPParser_Node_Expr_Variable(CONT_NAME));
-                        $stmts = array(new PHPParser_Node_Stmt_Return(new PHPParser_Node_Expr_StaticCall($class, NEW_NAME, $compiled_args)));
-                        
-                        return $final(array(new PHPParser_Node_Stmt_Return(
-                            new PHPParser_Node_Expr_Closure(array(
-                                'uses' => array(
-                                    new PHPParser_Node_Expr_ClosureUse(CONT_NAME),
-                                    new PHPParser_Node_Expr_ClosureUse(LOCALS_NAME, true),
-                                    new PHPParser_Node_Expr_ClosureUse(TEMP_NAME)
-                                ),
-                                'stmts' => $stmts
-                            ))
+                        $stmts = array(generateTryCatchCall(new PHPParser_Node_Expr_New($class, $compiled_args), $state));
+                    
+                        return $final(array(generateThunk(
+                            array(
+                                new PHPParser_Node_Expr_ClosureUse(CONT_NAME),
+                                new PHPParser_Node_Expr_ClosureUse(LOCALS_NAME, true),
+                                new PHPParser_Node_Expr_ClosureUse(TEMP_NAME)
+                            ),
+                            $stmts,
+                            'new'
                         )), $state);
                     }
                 }, $node->args, array(), $final, $state);
@@ -1518,6 +1808,14 @@ function traverseNode($node, $next, $final, $state) {
         return traverseNode($node->var, function ($var, $final, $state) use ($next, $name) {
             return traverseNode($name, function ($name, $final, $state) use ($next, $var) {
                 return $next(new PHPParser_Node_Expr_PropertyFetch($var, $name), $final, $state);
+            }, $final, $state);
+        }, $final, $state);
+    }
+    elseif ($node instanceof PHPParser_Node_Expr_StaticPropertyFetch) {
+        $name = $node->name;
+        return traverseNode($node->class, function ($class, $final, $state) use ($next, $name) {
+            return traverseNode($name, function ($name, $final, $state) use ($next, $class) {
+                return $next(new PHPParser_Node_Expr_StaticPropertyFetch($class, $name), $final, $state);
             }, $final, $state);
         }, $final, $state);
     }
@@ -1599,7 +1897,7 @@ function traverseNode($node, $next, $final, $state) {
             }
         }, $node->catches, array());
     }
-    elseif ($node instanceof PHPParser_Node_Expr_Include) {
+    elseif (false && $node instanceof PHPParser_Node_Expr_Include) {
         return generateContinuation($next, function ($continuation, $state) use ($final, $node) {
             return traverseNode($node->expr, function ($file, $final, $state) use ($node) {
                 $is_once = ($node->type == PHPParser_Node_Expr_Include::TYPE_INCLUDE_ONCE) || ($node->type == PHPParser_Node_Expr_Include::TYPE_REQUIRE_ONCE);
@@ -1609,13 +1907,34 @@ function traverseNode($node, $next, $final, $state) {
         
                 return $final(array(new PHPParser_Node_Stmt_Return(
                     new PHPParser_Node_Expr_FuncCall(new PHPParser_Node_Name('eval' /* evil, but no more so than include */), array(
-                        new PHPParser_Node_Expr_FuncCall(new PHPParser_Node_Name('_cps_include'), array(
+                        new PHPParser_Node_Expr_FuncCall(new PHPParser_Node_Name('_cps_include_eval'), array(
                             new PHPParser_Node_Arg($file),
                             new PHPParser_Node_Arg(new PHPParser_Node_Scalar_String($GLOBALS['compiler'])),
                             new PHPParser_Node_Arg($is_once),
                             new PHPParser_Node_Arg($is_require), 
                             new PHPParser_Node_Arg(new PHPParser_Node_Scalar_String($GLOBALS['file'])),
                             new PHPParser_Node_Arg(new PHPParser_Node_Scalar_LNumber($node->getLine()))
+                        ))
+                    ))
+                )), $state);
+            }, generateFinalForContinuation($final, $continuation), $state);
+        }, $state);
+    }
+    elseif ($node instanceof PHPParser_Node_Expr_Include) {
+        return generateContinuation($next, function ($continuation, $state) use ($final, $node) {
+            return traverseNode($node->expr, function ($file, $final, $state) use ($node) {
+                $is_once = ($node->type == PHPParser_Node_Expr_Include::TYPE_INCLUDE_ONCE) || ($node->type == PHPParser_Node_Expr_Include::TYPE_REQUIRE_ONCE);
+                $is_require = ($node->type == PHPParser_Node_Expr_Include::TYPE_REQUIRE) || ($node->type == PHPParser_Node_Expr_Include::TYPE_REQUIRE_ONCE);
+                $require = $is_require ? 'require' : 'include';
+                $once = $is_once ? '_once' : '';
+                $is_require = new PHPParser_Node_Expr_ConstFetch(new PHPParser_Node_Name($is_require ? 'true' : 'false'));
+        
+                return $final(array(new PHPParser_Node_Stmt_Return(
+                    new PHPParser_Node_Expr_FuncCall(new PHPParser_Node_Name($require . $once), array(
+                        new PHPParser_Node_Expr_FuncCall(new PHPParser_Node_Name('_cps_include'), array(
+                            new PHPParser_Node_Arg($file),
+                            new PHPParser_Node_Arg(new PHPParser_Node_Scalar_String($GLOBALS['compiler'])),
+                            new PHPParser_Node_Arg($is_require)
                         ))
                     ))
                 )), $state);
@@ -1655,74 +1974,13 @@ function compile($code) {
     
     return run(function ($cont) use ($stmts) {
         $state = new FunctionState();
-        return traverseStatements($stmts, $cont, generateReturn(new PHPParser_Node_Expr_ConstFetch(new PHPParser_Node_Name('null')), $state), $state, true);
+        return traverseStatements($stmts, $cont, generateReturn(new PHPParser_Node_Scalar_LNumber(1), $state), $state, true);
     });
 }
 
 function generateTrampoline($stmts) {
     return array(new PHPParser_Node_Stmt_Return(
-        new PHPParser_Node_Expr_FuncCall(new PHPParser_Node_Name('call_user_func'), array(
-            new PHPParser_Node_Expr_Closure(array(
-                'params' => array(new PHPParser_Node_Param('thunk')),
-                'stmts' => array(
-                    new PHPParser_Node_Expr_Assign(
-                        new PHPParser_Node_Expr_Variable('result_container'),
-                        new PHPParser_Node_Expr_Array()
-                    ),
-                    new PHPParser_Node_Expr_Assign(
-                        new PHPParser_Node_Expr_Variable('exception_container'),
-                        new PHPParser_Node_Expr_Array()
-                    ),
-                    new PHPParser_Node_Stmt_While(new PHPParser_Node_Expr_Variable('thunk'), array(
-                        new PHPParser_Node_Expr_Assign(
-                            new PHPParser_Node_Expr_Variable('thunk'),
-                            new PHPParser_Node_Expr_FuncCall(
-                                new PHPParser_Node_Expr_Variable('thunk'),
-                                array(
-                                    new PHPParser_Node_Expr_Closure(array(
-                                        'params' => array(new PHPParser_Node_Param('result')),
-                                        'uses' => array(new PHPParser_Node_Expr_ClosureUse('result_container', true)),
-                                        'stmts' => array(new PHPParser_Node_Expr_Assign(
-                                            new PHPParser_Node_Expr_ArrayDimFetch(new PHPParser_Node_Expr_Variable('result_container')),
-                                            new PHPParser_Node_Expr_Variable('result')
-                                        ))
-                                    )),
-                                    new PHPParser_Node_Expr_Array(array(new PHPParser_Node_Expr_ArrayItem(
-                                        new PHPParser_Node_Expr_Closure(array(
-                                            'params' => array(new PHPParser_Node_Param('exception')),
-                                            'uses' => array(new PHPParser_Node_Expr_ClosureUse('exception_container', true)),
-                                            'stmts' => array(new PHPParser_Node_Expr_Assign(
-                                                new PHPParser_Node_Expr_ArrayDimFetch(new PHPParser_Node_Expr_Variable('exception_container')),
-                                                new PHPParser_Node_Expr_Variable('exception')
-                                            ))
-                                        ))
-                                    )))
-                                )
-                            )
-                        ),
-                        new PHPParser_Node_Stmt_If(new PHPParser_Node_Expr_Variable('result_container'), array(
-                            'stmts' => array(
-                                new PHPParser_Node_Stmt_Return(
-                                    new PHPParser_Node_Expr_ArrayDimFetch(
-                                        new PHPParser_Node_Expr_Variable('result_container'),
-                                        new PHPParser_Node_Scalar_LNumber(0)
-                                    )
-                                )
-                            )
-                        )),
-                        new PHPParser_Node_Stmt_If(new PHPParser_Node_Expr_Variable('exception_container'), array(
-                            'stmts' => array(
-                                new PHPParser_Node_Stmt_Throw(
-                                    new PHPParser_Node_Expr_ArrayDimFetch(
-                                        new PHPParser_Node_Expr_Variable('exception_container'),
-                                        new PHPParser_Node_Scalar_LNumber(0)
-                                    )
-                                )
-                            )
-                        ))
-                    ))
-                )
-            )),
+        new PHPParser_Node_Expr_FuncCall(new PHPParser_Node_Name('_cps_trampoline'), array(
             new PHPParser_Node_Expr_Closure(array(
                 'params' => array(
                     new PHPParser_Node_Param(CONT_NAME),
@@ -1739,21 +1997,40 @@ function generateTrampoline($stmts) {
     ));
 }
 
-$source = file_get_contents('php://stdin');
-$compiled = compile($source);
+function generateThunk($uses, $stmts, $type) {
+    $result = new PHPParser_Node_Stmt_Return(
+        new PHPParser_Node_Expr_Closure(array(
+            'uses' => $uses,
+            'stmts' => $stmts
+        ))
+    );
 
-switch ($mode = $argv[2]) {
-    case 'main':
-        echo "<?php\nrequire_once('" . dirname(__FILE__) . "/runtime.php');\n\$l=&\$GLOBALS;\n\$t=array();\n\$g=array();\n";
-        printStatements(generateTrampoline($compiled));
-        echo "\n";
-        break;
-
-    case 'include':
-        printStatements($compiled);
-        break;
+    if ($max_stack = config('trampoline_max_stack')) {
+        return new PHPParser_Node_Stmt_If(
+            new PHPParser_Node_Expr_Smaller(
+                new PHPParser_Node_Expr_PreInc(
+                    new PHPParser_Node_Expr_ArrayDimFetch(
+                        new PHPParser_Node_Expr_Variable('GLOBALS'),
+                        new PHPParser_Node_Scalar_String('__cps_tsd')
+                    )
+                ),
+                new PHPParser_Node_Scalar_LNumber(config('trampoline_max_stack'))
+            ),
+            array(
+                'stmts' => $stmts,
+                'else' => new PHPParser_Node_Stmt_Else(array(
+                    new PHPParser_Node_Expr_Assign(
+                        new PHPParser_Node_Expr_ArrayDimFetch(
+                            new PHPParser_Node_Expr_Variable('GLOBALS'),
+                            new PHPParser_Node_Scalar_String('__cps_tsd')
+                        ),
+                        new PHPParser_Node_Scalar_LNumber(0)
+                    ),
+                    $result
+                ))
+            )
+        );
+    }
     
-    default:
-        throw new Exception('unknown mode ' . $mode);
-        break;
+    return $result;
 }

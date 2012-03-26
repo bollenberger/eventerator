@@ -1,0 +1,5 @@
+#!/bin/sh
+if [ -x $PHP_INTERPRETER ]; then
+    PHP_INTERPRETER=`which php54`
+fi
+$PHP_INTERPRETER cps.php $PHP_INTERPRETER main $1 < $1
