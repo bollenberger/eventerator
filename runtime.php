@@ -156,15 +156,6 @@ function __cps_add_builtin($name) {
 
 foreach (get_loaded_extensions() as $extension) {
     foreach (get_extension_funcs($extension) ?: array() as $name) {
-/*foreach (array(
-'ob_implicit_flush',
-'ob_start',
-'str_repeat',
-'array_fill',
-'substr',
-'strlen',
-'print'
-) as $name) {*/
         __cps_add_builtin($name);
     }
 }
@@ -183,14 +174,35 @@ $STATIC_FUNCTION_TRANSFORM['func_get_args'] = function ($function, $args, $state
 //    return $c($t['A']);
 //};
 
+// Wrap callback parameters to builtins in their own trampolines.
 foreach (array(
     'spl_autoload_register' => array(0),
     'array_map' => array(0),
-    'preg_replace_callback' => array(1)
+    'preg_replace_callback' => array(1),
+    'array_diff_uassoc' => array(-1),
+    'array_diff_ukey' => array(-1),
+    'array_filter' => array(1),
+    'array_intersect_uassoc' => array(-1),
+    'array_intersect_ukey' => array(-1),
+    'array_reduce' => array(1),
+    'array_udiff_assoc' => array(-1),
+    'array_udiff_uassoc' => array(-1, -2),
+    'array_udiff' => array(-1),
+    'array_uintersect_assoc' => array(-1),
+    'array_uintersect_uassoc' => array(-1, -2),
+    'array_uintersect' => array(-1),
+    'array_walk_recursive' => array(1),
+    'array_walk' => array(1),
+    'uasort' => array(1),
+    'uksort' => array(1),
+    'usort' => array(1)
     ) as $function_name => $indices)
 {
     $STATIC_FUNCTION_TRANSFORM[$function_name] = function ($function, $args, $state) use ($indices) {
         foreach ($indices as $i) {
+            if ($i < 0) {
+                $i += count($args);
+            }
             if (count($args) > $i) {
                 $args[$i] = new PHPParser_Node_Arg(wrapFunctionForCallback($args[$i]->value, $state));
             }
