@@ -495,6 +495,22 @@ function catch_exception() {
 }
 prove(1 == catch_exception());
 
+// Testing capture of $this in closure
+class ThisCapture {
+    function foo() {
+        return function () {
+            return $this->secret();
+        };
+    }
+    
+    private function secret() {
+        return 5;
+    }
+}
+$x = new ThisCapture();
+$f = $x->foo();
+prove(5 == $f());
+
 // Testing output operators and that the tests completed execution.
 ?>
 D<?php
