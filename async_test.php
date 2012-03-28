@@ -28,7 +28,7 @@ $listener = Events::listen('tcp://127.0.0.1:12345', function ($client) {
 });
 Events::connect('tcp://127.0.0.1:12345', function ($connection) use ($listener) {
     $connection->write("abc\r\n", function () use ($connection, $listener) {
-        //$connection->flush();
+        $connection->flush();
         $connection->readline(function ($line) use ($connection, $listener) {
             prove($line == 'abc');
             echo "2\n";
