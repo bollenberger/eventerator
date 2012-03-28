@@ -242,7 +242,7 @@ $STATIC_FUNCTION_TRANSFORM['callcc'] = function ($function, $args, $state) {
             'params' => array(
                 new PHPParser_Node_Param('j'),
                 new PHPParser_Node_Param('j'),
-                new PHPParser_Node_Param('v')
+                new PHPParser_Node_Param('v', new PHPParser_Node_Expr_ConstFetch(new PHPParser_Node_Name('null')))
             ),
             'uses' => array(
                 new PHPParser_Node_Expr_ClosureUse(CONT_NAME)
@@ -256,7 +256,7 @@ $STATIC_FUNCTION_TRANSFORM['callcc'] = function ($function, $args, $state) {
     )), $state);
 };
 $BUILTIN_FUNCTIONS['callcc'] = function ($f, $args, $c, $x) { // allows dynamic call to callcc. crazy, right?
-    return $args[0]($c, $x, function ($jc, $jx, $v) use ($c) {
+    return $args[0]($c, $x, function ($jc, $jx, $v = null) use ($c) {
         return $c($v);
     });
 };
@@ -300,3 +300,5 @@ $BUILTIN_FUNCTIONS['call_user_func_array'] = function ($f, $args, $c, $x) {
     array_unshift($args, $c);
     return call_user_func_array($f, $args);
 };
+
+require_once('compiler_plugins.php');
