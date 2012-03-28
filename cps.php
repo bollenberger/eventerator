@@ -280,10 +280,10 @@ function generateMethodCall($object, $function, $args, $type, $state) {
     $get_class = new PHPParser_Node_Expr_FuncCall(new PHPParser_Node_Name('get_class'), array($object));
     if ($type == PHPParser_Node_Expr_StaticCall) {
         if ($object->toString() == 'self') {
-            $object = $state->getSelf();
+            $object = new PHPParser_Node_Name($state->getSelf());
         }
         elseif ($object->toString() == 'parent') {
-            $object = $state->getParent();
+            $object = new PHPParser_Node_Name($state->getParent());
         }
         
         $get_class = new PHPParser_Node_Scalar_String($object->toString());
@@ -794,7 +794,7 @@ class FunctionState {
 }
 
 function traverseStatements($stmts, $final, $after_stmts, $state, $is_top_level = false) {
-    if ($stmts === null) { // This is for functions in interfaces, but probably need to do it differently TODO
+    if ($stmts === null) { // This is for functions in interfaces
         return $final(null, $state);
     }
 
@@ -1297,7 +1297,7 @@ function traverseNode($node, $next, $final, $state) {
             return $next($temp, function ($result, $state) use ($final, $stmts) {
                 return $final(array_merge($stmts, $result), $state);
             }, $state);
-        }, generateReturn(new PHPParser_Node_Expr_ConstFetch(new PHPParser_Node_Name('null')), $new_state/*TODO ??? */), $new_state, true);
+        }, generateReturn(new PHPParser_Node_Expr_ConstFetch(new PHPParser_Node_Name('null')), $new_state), $new_state, true);
     }
     elseif ($node instanceof PHPParser_Node_Expr_Array) {
         $node_items = $node->items;
