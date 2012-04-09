@@ -69,11 +69,11 @@ abstract class Request {
     }
     
     function complete() {
-        $connection =& $this->connection;
-        $is_complete =& $this->is_complete;
         $this->write('', function () {
-            $this->is_complete = true;
-            $this->connection->close();
+            if (!$this->is_complete) {
+                $this->is_complete = true;
+                $this->connection->close();
+            }
         });
     }
     
