@@ -13,6 +13,7 @@
 require_once 'PHP-Parser/lib/bootstrap.php';
 require_once 'print.php';
 require_once 'runtime.php';
+require_once 'compiler_plugins.php';
 
 const TEMP_NAME = 't';
 const GLOBALS_TEMP_NAME = 'G';
@@ -288,7 +289,7 @@ function generateMethodCall($object, $function, $args, $type, $state) {
         
         $get_class = new PHPParser_Node_Scalar_String($object->toString());
         
-        if (isset($GLOBALS['CLASS_TO_BUILTIN_FUNCTIONS'][$object->toString()][$function])) {
+        if (isset(CpsRuntime::$builtin_methods[$object->toString()][$function])) {
             $is_builtin_call = true;
         }
     }
@@ -306,9 +307,9 @@ function generateMethodCall($object, $function, $args, $type, $state) {
             new PHPParser_Node_Expr_Isset([
                 new PHPParser_Node_Expr_ArrayDimFetch(
                     new PHPParser_Node_Expr_ArrayDimFetch(
-                        new PHPParser_Node_Expr_ArrayDimFetch(
-                            new PHPParser_Node_Expr_Variable('GLOBALS'),
-                            new PHPParser_Node_Scalar_String('CLASS_TO_BUILTIN_METHODS')
+                        new PHPParser_Node_Expr_StaticPropertyFetch(
+                            new PHPParser_Node_Name('CpsRuntime'),
+                            'builtin_methods'
                         ),
                         $get_class
                     ),
@@ -355,14 +356,15 @@ function wrapFunctionForCallback($function, $state) {
         ])
     )];
     $function_transformer = new PHPParser_Node_Expr_ArrayDimFetch(
-        new PHPParser_Node_Expr_ArrayDimFetch(
-            new PHPParser_Node_Expr_Variable('GLOBALS'),
-            new PHPParser_Node_Scalar_String('BUILTIN_FUNCTIONS')
+        new PHPParser_Node_Expr_StaticPropertyFetch(
+            new PHPParser_Node_Name('CpsRuntime'),
+            'builtin_functions'
         ),
         new PHPParser_Node_Expr_Variable(VALUE_NAME)
     );
     $builtin_call_stmts = [new PHPParser_Node_Stmt_Return(
-        new PHPParser_Node_Expr_FuncCall($function_transformer, [
+        new PHPParser_Node_Expr_FuncCall(new PHPParser_Node_Name('call_user_func'), [
+            $function_transformer,
             new PHPParser_Node_Expr_Variable(VALUE_NAME),
             new PHPParser_Node_Expr_ArrayDimFetch(
                 new PHPParser_Node_Expr_Variable(TEMP_NAME),
@@ -396,9 +398,9 @@ function wrapFunctionForCallback($function, $state) {
                         new PHPParser_Node_Expr_FuncCall(new PHPParser_Node_Name('is_string'), [new PHPParser_Node_Expr_Variable(VALUE_NAME)]),
                         new PHPParser_Node_Expr_FuncCall(new PHPParser_Node_Name('array_key_exists'), [
                             new PHPParser_Node_Expr_Variable(VALUE_NAME),
-                            new PHPParser_Node_Expr_ArrayDimFetch(
-                                new PHPParser_Node_Expr_Variable('GLOBALS'),
-                                new PHPParser_Node_Scalar_String('BUILTIN_FUNCTIONS')
+                            new PHPParser_Node_Expr_StaticPropertyFetch(
+                                new PHPParser_Node_Name('CpsRuntime'),
+                                'builtin_functions'
                             )
                         ])
                     ),
@@ -418,14 +420,14 @@ function generateFunctionCall($function, $args, $state) {
     }
     
     $function_key = null;
-    if ($function instanceof PHPParser_Node_Name && array_key_exists($function->toString(), $GLOBALS['STATIC_FUNCTION_TRANSFORM'])) {
+    if ($function instanceof PHPParser_Node_Name && array_key_exists($function->toString(), CpsRuntime::$function_transforms)) {
         $function_key = $function->toString();
     }
     
     
     if ($function instanceof PHPParser_Node_Name) {
         if ($function_key) {
-            return $GLOBALS['STATIC_FUNCTION_TRANSFORM'][$function_key]($function, $args, $state);
+            return call_user_func(CpsRuntime::$function_transforms[$function_key], $function, $args, $state);
         }
         else {
             // if we have a null function key that means it's not a true builtin function
@@ -436,7 +438,7 @@ function generateFunctionCall($function, $args, $state) {
         }
     }
     elseif ($function instanceof PHPParser_Node_Expr_Closure) {
-        $stmts = $GLOBALS['STATIC_FUNCTION_TRANSFORM'][$function_key](new PHPParser_Node_Expr_Variable(VALUE_NAME), $args, $state);
+        $stmts = call_user_func(CpsRuntime::$function_transforms[$function_key], new PHPParser_Node_Expr_Variable(VALUE_NAME), $args, $state);
         array_unshift($stmts, new PHPParser_Node_Expr_Assign(
             new PHPParser_Node_Expr_Variable(VALUE_NAME),
             $function
@@ -452,16 +454,17 @@ function generateFunctionCall($function, $args, $state) {
         $callable_function = $function;
     }
     
-    $user_call_stmts = $GLOBALS['STATIC_FUNCTION_TRANSFORM'][null]($callable_function, $args, $state);
+    $user_call_stmts = call_user_func(CpsRuntime::$function_transforms[null], $callable_function, $args, $state);
     $function_transformer = new PHPParser_Node_Expr_ArrayDimFetch(
-        new PHPParser_Node_Expr_ArrayDimFetch(
-            new PHPParser_Node_Expr_Variable('GLOBALS'),
-            new PHPParser_Node_Scalar_String('BUILTIN_FUNCTIONS')
+        new PHPParser_Node_Expr_StaticPropertyFetch(
+            new PHPParser_Node_Name('CpsRuntime'),
+            'builtin_functions'
         ),
         $function
     );
     $builtin_call_stmts = [new PHPParser_Node_Stmt_Return(
-        new PHPParser_Node_Expr_FuncCall($function_transformer, [
+        new PHPParser_Node_Expr_FuncCall(new PHPParser_Node_Name('call_user_func'), [
+            $function_transformer,
             $function,
             new PHPParser_Node_Expr_Array(array_map(function ($arg) {
                 return new PHPParser_Node_Expr_ArrayItem($arg->value, null, isLValue($arg->value));
@@ -474,9 +477,9 @@ function generateFunctionCall($function, $args, $state) {
     $conditions = new PHPParser_Node_Expr_FuncCall(new PHPParser_Node_Name('array_key_exists'),
         [
             $function,
-            new PHPParser_Node_Expr_ArrayDimFetch(
-                new PHPParser_Node_Expr_Variable('GLOBALS'),
-                new PHPParser_Node_Scalar_String('BUILTIN_FUNCTIONS')
+            new PHPParser_Node_Expr_StaticPropertyFetch(
+                new PHPParser_Node_Name('CpsRuntime'),
+                'builtin_functions'
             )
         ]
     );
@@ -569,9 +572,9 @@ class FunctionState {
     function generateBuiltinMethodDeclarations() {
         return [new PHPParser_Node_Expr_Assign(
             new PHPParser_Node_Expr_ArrayDimFetch(
-                new PHPParser_Node_Expr_ArrayDimFetch(
-                    new PHPParser_Node_Expr_Variable('GLOBALS'),
-                    new PHPParser_Node_Scalar_String('CLASS_TO_BUILTIN_METHODS')
+                new PHPParser_Node_Expr_StaticPropertyFetch(
+                    new PHPParser_Node_Name('CpsRuntime'),
+                    'builtin_methods'
                 ),
                 new PHPParser_Node_Scalar_String($this->getSelf())
             ),
@@ -1201,11 +1204,11 @@ function traverseNode($node, $next, $final, $state) {
         {
             // "fast" pragma to treat this function as a builtin
             // this promises that the function does not call any non-fast functions
-            __cps_add_builtin($node->name);
+            CpsRuntime::add_builtin_function($node->name);
             array_shift($node->stmts); // drop the pragma
             return $next([
                 $node,
-                new PHPParser_Node_Expr_FuncCall(new PHPParser_Node_Name('__cps_add_builtin'), [
+                new PHPParser_Node_Expr_StaticCall(new PHPParser_Node_Name('CpsRuntime'), new PHPParser_Node_Name('add_builtin_function'), [
                     new PHPParser_Node_Scalar_String($node->name)
                 ])
             ], $final, $state);
@@ -1655,18 +1658,18 @@ function traverseNode($node, $next, $final, $state) {
         $new_state->setParent($node->extends);
 
         $builtin_methods = [];
-        if ($node->extends && array_key_exists($node->extends->toString(), $GLOBALS['CLASS_TO_BUILTIN_METHODS'])) {
-            $builtin_methods = $GLOBALS['CLASS_TO_BUILTIN_METHODS'][$node->extends->toString()];
+        if ($node->extends && array_key_exists($node->extends->toString(), CpsRuntime::$builtin_methods)) {
+            $builtin_methods = CpsRuntime::$builtin_methods[$node->extends->toString()];
             
-            $GLOBALS['CLASS_TO_BUILTIN_METHODS'][$node->name] = $builtin_methods;
+            CpsRuntime::$builtin_methods[$node->name] = $builtin_methods;
             // Find non-builtins that are defined in this class
             foreach ($node->stmts as $method) {
                 if ($method instanceof PHPParser_Node_Stmt_ClassMethod) {
-                    unset($GLOBALS['CLASS_TO_BUILTIN_METHODS'][$node->name][$method->name]);
+                    unset(CpsRuntime::$builtin_methods[$node->name][$method->name]);
                 }
             }
             
-            foreach ($GLOBALS['CLASS_TO_BUILTIN_METHODS'][$node->name] as $method_name => $junk) {
+            foreach (CpsRuntime::$builtin_methods[$node->name] as $method_name => $junk) {
                 $new_state->addBuiltinMethod($method_name);
             }
         }
@@ -1691,11 +1694,11 @@ function traverseNode($node, $next, $final, $state) {
             $node->stmts[0]->value == 'fast')
         {
             array_shift($node->stmts);
-            __cps_add_builtin_method($state->getSelf(), $node->name);
+            CpsRuntime::add_builtin_method($state->getSelf(), $node->name);
             $state->addBuiltinMethod($node->name);
             return $next($node, $final, $state);
         }
-    
+
         generateParams($node->params, $params, $param_items);
         
         $name = $node->name;
@@ -1894,29 +1897,6 @@ function traverseNode($node, $next, $final, $state) {
             }
         }, $node->catches, []);
     }
-    elseif (false && $node instanceof PHPParser_Node_Expr_Include) {
-        return generateContinuation($next, function ($continuation, $state) use ($final, $node) {
-            return traverseNode($node->expr, function ($file, $final, $state) use ($node) {
-                $is_once = ($node->type == PHPParser_Node_Expr_Include::TYPE_INCLUDE_ONCE) || ($node->type == PHPParser_Node_Expr_Include::TYPE_REQUIRE_ONCE);
-                $is_require = ($node->type == PHPParser_Node_Expr_Include::TYPE_REQUIRE) || ($node->type == PHPParser_Node_Expr_Include::TYPE_REQUIRE_ONCE);
-                $is_once = new PHPParser_Node_Expr_ConstFetch(new PHPParser_Node_Name($is_once ? 'true' : 'false'));
-                $is_require = new PHPParser_Node_Expr_ConstFetch(new PHPParser_Node_Name($is_require ? 'true' : 'false'));
-        
-                return $final([new PHPParser_Node_Stmt_Return(
-                    new PHPParser_Node_Expr_FuncCall(new PHPParser_Node_Name('eval' /* evil, but no more so than include */), [
-                        new PHPParser_Node_Expr_FuncCall(new PHPParser_Node_Name('_cps_include_eval'), [
-                            new PHPParser_Node_Arg($file),
-                            new PHPParser_Node_Arg(new PHPParser_Node_Scalar_String($GLOBALS['compiler'])),
-                            new PHPParser_Node_Arg($is_once),
-                            new PHPParser_Node_Arg($is_require), 
-                            new PHPParser_Node_Arg(new PHPParser_Node_Scalar_String($GLOBALS['file'])),
-                            new PHPParser_Node_Arg(new PHPParser_Node_Scalar_LNumber($node->getLine()))
-                        ])
-                    ])
-                )], $state);
-            }, generateFinalForContinuation($final, $continuation), $state);
-        }, $state);
-    }
     elseif ($node instanceof PHPParser_Node_Expr_Include) {
         return generateContinuation($next, function ($continuation, $state) use ($final, $node) {
             return traverseNode($node->expr, function ($file, $final, $state) use ($node) {
@@ -1928,7 +1908,7 @@ function traverseNode($node, $next, $final, $state) {
         
                 return $final([new PHPParser_Node_Stmt_Return(
                     new PHPParser_Node_Expr_FuncCall(new PHPParser_Node_Name($require . $once), [
-                        new PHPParser_Node_Expr_FuncCall(new PHPParser_Node_Name('_cps_include'), [
+                        new PHPParser_Node_Expr_StaticCall(new PHPParser_Node_Name('CpsRuntime'), new PHPParser_Node_Name('include_file'), [
                             new PHPParser_Node_Arg($file),
                             new PHPParser_Node_Arg(new PHPParser_Node_Scalar_String($GLOBALS['compiler'])),
                             new PHPParser_Node_Arg($is_require)
@@ -1977,7 +1957,7 @@ function compile($code) {
 
 function generateTrampoline($stmts) {
     return [new PHPParser_Node_Stmt_Return(
-        new PHPParser_Node_Expr_FuncCall(new PHPParser_Node_Name('_cps_trampoline'), [
+        new PHPParser_Node_Expr_StaticCall(new PHPParser_Node_Name('CpsRuntime'), new PHPParser_Node_Name('trampoline'), [
             new PHPParser_Node_Expr_Closure([
                 'params' => [
                     new PHPParser_Node_Param(CONT_NAME),
@@ -2006,9 +1986,9 @@ function generateThunk($uses, $stmts, $type) {
         return new PHPParser_Node_Stmt_If(
             new PHPParser_Node_Expr_Smaller(
                 new PHPParser_Node_Expr_PreInc(
-                    new PHPParser_Node_Expr_ArrayDimFetch(
-                        new PHPParser_Node_Expr_Variable('GLOBALS'),
-                        new PHPParser_Node_Scalar_String('__cps_tsd')
+                    new PHPParser_Node_Expr_StaticPropertyFetch(
+                        new PHPParser_Node_Name('CpsRuntime'),
+                        'stack_depth'
                     )
                 ),
                 new PHPParser_Node_Scalar_LNumber(config('trampoline_max_stack'))
@@ -2017,9 +1997,9 @@ function generateThunk($uses, $stmts, $type) {
                 'stmts' => $stmts,
                 'else' => new PHPParser_Node_Stmt_Else([
                     new PHPParser_Node_Expr_Assign(
-                        new PHPParser_Node_Expr_ArrayDimFetch(
-                            new PHPParser_Node_Expr_Variable('GLOBALS'),
-                            new PHPParser_Node_Scalar_String('__cps_tsd')
+                        new PHPParser_Node_Expr_StaticPropertyFetch(
+                            new PHPParser_Node_Name('CpsRuntime'),
+                            'stack_depth'
                         ),
                         new PHPParser_Node_Scalar_LNumber(0)
                     ),
