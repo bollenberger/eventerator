@@ -1,46 +1,68 @@
 <?php
 
 class ThreadLocal {
-    private static $locals = null;
+    private static $context = null;
     
-    private $context = [];
+    private $vars = [];
+    private $save_callbacks = [];
+    private $restore_callbacks = [];
     
-    private function __construct() {
-        
-    }
-    
-    public static function restoreContext(ThreadLocal $context) {
-        $old = self::$locals;
-        $old->save();
-        $context->restore();
-        self::$locals = $context;
-        return $old;
-    }
-    
-    public static function newContext() {
-        $old = self::$locals;
-        self::$locals = new ThreadLocal();
-        if ($old) {
+    public function __construct() {
+        if ($old = self::$context) {
             $old->save();
         }
-        return $old;
+        self::$context = $this;
+    }
+    
+    public static function getContext() {
+        if (!self::$context) {
+            self::$context = new ThreadLocal();
+        }
+        return self::$context;
     }
     
     public static function assign(&$ref, $value) {
         $ref = $value;
-        self::$locals->context[] = [&$ref, $value];
+        self::getContext()->vars[] = [&$ref, $value];
+    }
+    
+    public static function onSaveRestore($save, $restore) {
+        $context = self::getContext();
+        $context->save_callbacks[] = $save;
+        $context->restore_callbacks[] = $restore;
+    }
+    
+    public static function onSave($callback) {
+        self::getContext()->save_callbacks[] = $callback;
+    }
+    
+    public static function onRestore($callback) {
+        self::getContext()->restore_callbacks[] = $callback;
     }
     
     private function save() {
-        foreach ($this->context as $var) {
+        foreach ($this->vars as $var) {
             $var[1] = $var[0];
             $var[0] = null;
         }
+        foreach ($this->save_callbacks as $callback) {
+            call_user_func($callback);
+        }
     }
     
-    private function restore() {
-        foreach ($this->context as $var) {
+    public function restore() {
+        if (self::$context === $this) {
+            return;
+        }
+        
+        $old = self::getContext();
+        $old->save();
+        foreach ($this->vars as $var) {
             $var[0] = $var[1];
         }
+        foreach ($this->restore_callbacks as $callback) {
+            call_user_func($callback);
+        }
+        self::$context = $this;
     }
 }

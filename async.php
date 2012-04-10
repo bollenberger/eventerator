@@ -4,16 +4,18 @@
  * Asynchronous I/O library for PHP streams.
  **/
 
+require_once('threadlocal.php');
+
 class Events {
-    private static $read_callbacks = array();
-    private static $read_streams = array();
-    private static $write_callbacks = array();
-    private static $write_streams = array();
-    private static $except_callbacks = array();
-    private static $except_streams = array();
-    private static $close_callbacks = array();
-    private static $timers = array();
-    private static $yield = array();
+    private static $read_callbacks = [];
+    private static $read_streams = [];
+    private static $write_callbacks = [];
+    private static $write_streams = [];
+    private static $except_callbacks = [];
+    private static $except_streams = [];
+    private static $close_callbacks = [];
+    private static $timers = [];
+    private static $yield = [];
 
     public static function listen($address, $callback) {
         $socket = stream_socket_server($address, $errno, $errstr, STREAM_SERVER_BIND | STREAM_SERVER_LISTEN);
@@ -70,26 +72,26 @@ class Events {
                 ++$start;
             }
         }
-        array_splice(self::$timers, $start, 0, array(array($at, $callback)));
+        array_splice(self::$timers, $start, 0, [[$at, $callback, ThreadLocal::getContext()]]);
     }
 
     public static function on_read($stream, $callback) {
-        self::$read_callbacks[$stream][] = $callback;
+        self::$read_callbacks[$stream][] = [$callback, ThreadLocal::getContext()];
         self::$read_streams[$stream] = $stream;
     }
     
     public static function on_write($stream, $callback) {
-        self::$write_callbacks[$stream][] = $callback;
+        self::$write_callbacks[$stream][] = [$callback, ThreadLocal::getContext()];
         self::$write_streams[$stream] = $stream;
     }
     
     public static function on_except($stream, $callback) {
-        self::$except_callbacks[$stream][] = $callback;
+        self::$except_callbacks[$stream][] = [$callback, ThreadLocal::getContext()];
         self::$except_streams[$stream] = $stream;
     }
     
     public static function on_close($stream, $callback) {
-        self::$close_callbacks[$stream][] = $callback;
+        self::$close_callbacks[$stream][] = [$callback, ThreadLocal::getContext()];
     }
     
     public static function unregister_read($stream) {
@@ -125,7 +127,8 @@ class Events {
     public static function close($stream) {
         if (isset(self::$close_callbacks[$stream])) {
             foreach (self::$close_callbacks[$stream] as $callback) {
-                call_user_func($callback);
+                $callback[1]->restore();
+                call_user_func($callback[0]);
             }
             unset(self::$close_callbacks[$stream]);
         }
@@ -169,10 +172,11 @@ class Events {
                     foreach ($read_streams as $stream) {
                         $callbacks =& self::$read_callbacks[$stream];
                         $is_first = true;
-                        while (count($callbacks) && ($this_callback = $callbacks[0]) !== $last_callback) {
-                            $last_callback = $this_callback;
+                        while (count($callbacks) && ($this_callback = $callbacks[0]) && $this_callback[0] !== $last_callback) {
+                            $last_callback = $this_callback[0];
                             self::perform_callback(function () use ($this_callback, $is_first) {
-                                call_user_func($this_callback, $is_first);
+                                $this_callback[1]->restore();
+                                call_user_func($this_callback[0], $is_first);
                             });
                             $is_first = false;
                         }
@@ -183,9 +187,10 @@ class Events {
                     foreach ($write_streams as $stream) {
                         if (array_key_exists((int)$stream, self::$write_callbacks)) {
                             $callbacks =& self::$write_callbacks[$stream];
-                            while (count($callbacks) && ($this_callback = $callbacks[0]) !== $last_callback) {
-                                $last_callback = $this_callback;
-                                self::perform_callback($this_callback);
+                            while (count($callbacks) && ($this_callback = $callbacks[0]) && $this_callback[0] !== $last_callback) {
+                                $last_callback = $this_callback[0];
+                                $this_callback[1]->restore();
+                                self::perform_callback($this_callback[0]);
                             }
                         }
                     }
@@ -195,9 +200,10 @@ class Events {
                     foreach ($except_streams as $stream) {
                         if (array_key_exists((int)$stream, self::$except_callbacks)) {
                             $callbacks =& self::$except_callbacks[$stream];
-                            while (count($callbacks) && ($this_callback = $callbacks[0]) !== $last_callback) {
-                                $last_callback = $this_callback;
-                                self::perform_callback($this_callback);
+                            while (count($callbacks) && ($this_callback = $callbacks[0]) && $this_callback[0] !== $last_callback) {
+                                $last_callback = $this_callback[0];
+                                $this_callback[1]->restore();
+                                self::perform_callback($this_callback[0]);
                             }
                         }
                     }
@@ -215,7 +221,7 @@ class Events {
                 while (count(self::$timers) > 0) {
                     $timer = array_shift(self::$timers);
                     if ($timer[0] <= microtime(true)) {
-                        //print_r($timer[1]);
+                        $timer[2]->restore();
                         self::perform_callback($timer[1]);
                     }
                     else {
@@ -256,7 +262,7 @@ class Events {
 
 class IO {
     private $stream;
-    private $data_in = array();
+    private $data_in = [];
     private $data_in_count = 0;
     private $is_closed = false;
     
@@ -311,7 +317,7 @@ class IO {
         $data = implode($data_in);
         
         if (false !== ($pos = strpos($data, $delimiter))) {
-            $data_in = array(substr($data, $pos + strlen($delimiter)));
+            $data_in = [substr($data, $pos + strlen($delimiter))];
             $data_in_count = strlen($data_in[0]);
             call_user_func($callback, substr($data, 0, $pos));
         }
@@ -334,12 +340,12 @@ class IO {
             $data = implode($data_in);
             if (false !== ($pos = strpos($data, $delimiter))) {
                 Events::unregister_read($this->stream);
-                $data_in = array(substr($data, $pos + strlen($delimiter)));
+                $data_in = [substr($data, $pos + strlen($delimiter))];
                 $data_in_count = strlen($data_in[0]);
                 call_user_func($callback, substr($data, 0, $pos));
             }
             else {
-                $data_in = array($data);
+                $data_in = [$data];
             }
         });
     }
@@ -350,7 +356,7 @@ class IO {
         
         if ($length <= $data_in_count) {
             $data = implode($data_in);
-            $data_in = array(substr($data, $length));
+            $data_in = [substr($data, $length)];
             $data_in_count = strlen($data_in[0]);
             call_user_func($callback, substr($data, 0, $length));
         }
@@ -374,7 +380,7 @@ class IO {
                 Events::unregister_read($this->stream);
                 
                 $data = implode($data_in);
-                $data_in = array(substr($data, $length));
+                $data_in = [substr($data, $length)];
                 $data_in_count = strlen($data_in[0]);
                 call_user_func($callback, substr($data, 0, $length));
             }
